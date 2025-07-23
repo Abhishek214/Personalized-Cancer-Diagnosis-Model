@@ -1,0 +1,141 @@
+import pandas as pd
+import matplotlib.pyplot as plt
+from tensorboard.backend.event_processing.event_accumulator import EventAccumulator
+import glob
+import os
+
+def extract_tensorboard_data(logdir):
+    """Extract training metrics from TensorBoard logs"""
+    
+    # Find all event files
+    event_files = glob.glob(os.path.join(logdir, 'events.out.tfevents.*'))
+    
+    if not event_files:
+        print(f"No TensorBoard logs found in {logdir}")
+        return None
+    
+    # Use latest event file
+    latest_file = max(event_files, key=os.path.getctime)
+    
+    # Load TensorBoard data
+    ea = EventAccumulator(latest_file)
+    ea.Reload()
+    
+    # Extract metrics
+    data = {}
+    
+    # Get available scalar tags
+    tags = ea.Tags()['scalars']
+    print(f"Available metrics: {tags}")
+    
+    for tag in tags:
+        scalar_events = ea.Scalars(tag)
+        steps = [event.step for event in scalar_events]
+        values = [event.value for event in scalar_events]
+        data[tag] = {'steps': steps, 'values': values}
+    
+    return data
+
+def plot_training_metrics(logdir):
+    """Plot training and validation metrics"""
+    
+    data = extract_tensorboard_data(logdir)
+    if not data:
+        return
+    
+    fig, axes = plt.subplots(2, 2, figsize=(15, 10))
+    
+    # Loss plots
+    if 'Loss/train' in data and 'Loss/val' in data:
+        ax = axes[0, 0]
+        ax.plot(data['Loss/train']['steps'], data['Loss/train']['values'], label='Train', alpha=0.7)
+        ax.plot(data['Loss/val']['steps'], data['Loss/val']['values'], label='Validation')
+        ax.set_title('Total Loss')
+        ax.set_xlabel('Steps')
+        ax.set_ylabel('Loss')
+        ax.legend()
+        ax.grid(True)
+    
+    # Classification loss
+    if 'Classification_loss/train' in data and 'Classification_loss/val' in data:
+        ax = axes[0, 1]
+        ax.plot(data['Classification_loss/train']['steps'], data['Classification_loss/train']['values'], 
+                label='Train', alpha=0.7)
+        ax.plot(data['Classification_loss/val']['steps'], data['Classification_loss/val']['values'], 
+                label='Validation')
+        ax.set_title('Classification Loss')
+        ax.set_xlabel('Steps')
+        ax.set_ylabel('Loss')
+        ax.legend()
+        ax.grid(True)
+    
+    # Regression loss
+    if 'Regression_loss/train' in data and 'Regression_loss/val' in data:
+        ax = axes[1, 0]
+        ax.plot(data['Regression_loss/train']['steps'], data['Regression_loss/train']['values'], 
+                label='Train', alpha=0.7)
+        ax.plot(data['Regression_loss/val']['steps'], data['Regression_loss/val']['values'], 
+                label='Validation')
+        ax.set_title('Regression Loss')
+        ax.set_xlabel('Steps')
+        ax.set_ylabel('Loss')
+        ax.legend()
+        ax.grid(True)
+    
+    # Learning rate
+    if 'learning_rate' in data:
+        ax = axes[1, 1]
+        ax.plot(data['learning_rate']['steps'], data['learning_rate']['values'])
+        ax.set_title('Learning Rate')
+        ax.set_xlabel('Steps')
+        ax.set_ylabel('LR')
+        ax.grid(True)
+    
+    plt.tight_layout()
+    plt.show()
+    
+    # Find best validation loss point
+    if 'Loss/val' in data:
+        val_steps = data['Loss/val']['steps']
+        val_losses = data['Loss/val']['values']
+        best_idx = val_losses.index(min(val_losses))
+        best_step = val_steps[best_idx]
+        best_loss = val_losses[best_idx]
+        
+        print(f"\nBest validation loss: {best_loss:.4f} at step {best_step}")
+        
+        # Estimate epoch (assuming you know steps per epoch)
+        steps_per_epoch = 200  # Adjust based on your dataset size / batch size
+        estimated_epoch = best_step // steps_per_epoch
+        print(f"Estimated best epoch: {estimated_epoch}")
+    
+    return data
+
+def compare_multiple_runs(logdirs):
+    """Compare multiple training runs"""
+    
+    plt.figure(figsize=(12, 8))
+    
+    for logdir in logdirs:
+        data = extract_tensorboard_data(logdir)
+        if data and 'Loss/val' in data:
+            label = os.path.basename(logdir)
+            plt.plot(data['Loss/val']['steps'], data['Loss/val']['values'], 
+                    label=f'{label} - Val Loss', linewidth=2)
+    
+    plt.title('Validation Loss Comparison')
+    plt.xlabel('Steps')
+    plt.ylabel('Loss')
+    plt.legend()
+    plt.grid(True)
+    plt.show()
+
+# Usage
+if __name__ == "__main__":
+    # Plot current training
+    logdir = "logs/abhil/tensorboard/"  # Adjust path
+    data = plot_training_metrics(logdir)
+    
+    # Or compare multiple runs
+    # logdirs = ["logs/run1/tensorboard/", "logs/run2/tensorboard/"]
+    # compare_multiple_runs(logdirs)
