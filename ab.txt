@@ -1,139 +1,21 @@
+from PIL import Image
 import numpy as np
 
-def nms_boxes(boxes, scores, score_threshold, nms_threshold):
-    """
-    Non-Maximum Suppression implementation that replaces cv2.dnn.NMSBoxes
-    
-    Args:
-        boxes: List or array of bounding boxes in format [x, y, width, height]
-        scores: List or array of confidence scores for each box
-        score_threshold: Minimum score threshold to keep boxes
-        nms_threshold: IoU threshold for NMS (overlap threshold)
-    
-    Returns:
-        indices: Array of indices of boxes to keep (same format as cv2.dnn.NMSBoxes)
-    """
-    
-    # Convert to numpy arrays
-    boxes = np.array(boxes, dtype=np.float32)
-    scores = np.array(scores, dtype=np.float32)
-    
-    # Filter boxes by score threshold
-    score_mask = scores > score_threshold
-    boxes = boxes[score_mask]
-    scores = scores[score_mask]
-    original_indices = np.where(score_mask)[0]
-    
-    if len(boxes) == 0:
-        return []
-    
-    # Convert boxes from [x, y, w, h] to [x1, y1, x2, y2]
-    x1 = boxes[:, 0]
-    y1 = boxes[:, 1]
-    x2 = boxes[:, 0] + boxes[:, 2]
-    y2 = boxes[:, 1] + boxes[:, 3]
-    
-    # Calculate areas
-    areas = (x2 - x1) * (y2 - y1)
-    
-    # Sort by scores in descending order
-    order = scores.argsort()[::-1]
-    
-    keep = []
-    
-    while len(order) > 0:
-        # Keep the box with highest score
-        i = order[0]
-        keep.append(original_indices[i])
-        
-        if len(order) == 1:
-            break
-        
-        # Calculate IoU with remaining boxes
-        xx1 = np.maximum(x1[i], x1[order[1:]])
-        yy1 = np.maximum(y1[i], y1[order[1:]])
-        xx2 = np.minimum(x2[i], x2[order[1:]])
-        yy2 = np.minimum(y2[i], y2[order[1:]])
-        
-        # Calculate intersection area
-        w = np.maximum(0, xx2 - xx1)
-        h = np.maximum(0, yy2 - yy1)
-        intersection = w * h
-        
-        # Calculate IoU
-        union = areas[i] + areas[order[1:]] - intersection
-        iou = intersection / union
-        
-        # Keep boxes with IoU less than threshold
-        indices = np.where(iou <= nms_threshold)[0]
-        order = order[indices + 1]  # +1 because we excluded the first element
-    
-    # Return as numpy array to match cv2.dnn.NMSBoxes format
-    return np.array(keep).reshape(-1, 1) if keep else np.array([])
-
-
-# Direct replacement for cv2.dnn.NMSBoxes
-def NMSBoxes(boxes, scores, score_threshold, nms_threshold):
-    """
-    Direct replacement for cv2.dnn.NMSBoxes
-    
-    Returns:
-        indices: Array that can be flattened (same as cv2.dnn.NMSBoxes output)
-    """
-    return nms_boxes(boxes, scores, score_threshold, nms_threshold)
-
-
-# Example usage that matches your apply_nms function
-def test_nms():
-    """Test function that demonstrates usage matching your code"""
-    
-    # Example boxes in [x, y, width, height] format
-    boxes = [
-        [100, 100, 50, 50],   # Box 1
-        [105, 105, 50, 50],   # Box 2 (overlaps with Box 1)
-        [200, 200, 60, 60],   # Box 3 (separate)
-        [110, 110, 45, 45],   # Box 4 (overlaps with Box 1 and 2)
-        [300, 300, 40, 40],   # Box 5 (separate)
-    ]
-    
-    scores = [0.9, 0.8, 0.95, 0.7, 0.85]
-    classes = [0, 0, 1, 0, 1]  # Example classes
-    
-    iou_threshold = 0.5
-    
-    # Simulate your apply_nms function logic
-    if len(boxes) == 0:
-        print("No boxes")
-        return [], [], []
-    
-    # Apply NMS - replace cv2.dnn.NMSBoxes with our function
-    indices = NMSBoxes(boxes, scores, 0.0, iou_threshold)
-    
-    if len(indices) > 0:
-        indices = indices.flatten()
-        kept_boxes = [boxes[i] for i in indices]
-        kept_scores = [scores[i] for i in indices] 
-        kept_classes = [classes[i] for i in indices]
-        
-        print("Original boxes:", boxes)
-        print("Original scores:", scores)
-        print("Kept indices:", indices)
-        print("Kept boxes:", kept_boxes)
-        print("Kept scores:", kept_scores)
-        print("Kept classes:", kept_classes)
-        
-        return kept_boxes, kept_scores, kept_classes
+if new_w != old_w or new_h != old_h:
+    # Convert float64 to uint8 (0-255 range)
+    if image.dtype == np.float64 or image.dtype == np.float32:
+        # Normalize to 0-1 range first, then scale to 0-255
+        image_normalized = (image - image.min()) / (image.max() - image.min())
+        image_uint8 = (image_normalized * 255).astype(np.uint8)
     else:
-        print("No boxes kept after NMS")
-        return [], [], []
-
-
-if __name__ == "__main__":
-    test_nms()
+        image_uint8 = image.astype(np.uint8)
     
-    print("\n" + "="*50)
-    print("USAGE: Replace this line in your apply_nms function:")
-    print("indices = cv2.dnn.NMSBoxes(boxes, scores, 0.0, iou_threshold)")
-    print("With:")
-    print("indices = NMSBoxes(boxes, scores, 0.0, iou_threshold)")
-    print("="*50)
+    pil_image = Image.fromarray(image_uint8)
+    
+    if interpolation is None:
+        resized_pil = pil_image.resize((new_w, new_h))
+    else:
+        resized_pil = pil_image.resize((new_w, new_h), interpolation)
+    
+    # Convert back to original dtype if needed
+    image = np.array(resized_pil).astype(image.dtype)
