@@ -2,7 +2,7 @@ import numpy as np
 
 def nms_boxes(boxes, scores, score_threshold, nms_threshold):
     """
-    Non-Maximum Suppression implementation that replaces cv2.nmsboxes
+    Non-Maximum Suppression implementation that replaces cv2.dnn.NMSBoxes
     
     Args:
         boxes: List or array of bounding boxes in format [x, y, width, height]
@@ -11,7 +11,7 @@ def nms_boxes(boxes, scores, score_threshold, nms_threshold):
         nms_threshold: IoU threshold for NMS (overlap threshold)
     
     Returns:
-        indices: List of indices of boxes to keep (same format as cv2.nmsboxes)
+        indices: Array of indices of boxes to keep (same format as cv2.dnn.NMSBoxes)
     """
     
     # Convert to numpy arrays
@@ -68,24 +68,24 @@ def nms_boxes(boxes, scores, score_threshold, nms_threshold):
         indices = np.where(iou <= nms_threshold)[0]
         order = order[indices + 1]  # +1 because we excluded the first element
     
-    return keep
+    # Return as numpy array to match cv2.dnn.NMSBoxes format
+    return np.array(keep).reshape(-1, 1) if keep else np.array([])
 
 
-# Alternative version that returns results in the same format as cv2.nmsboxes
-def nms_boxes_cv2_format(boxes, scores, score_threshold, nms_threshold):
+# Direct replacement for cv2.dnn.NMSBoxes
+def NMSBoxes(boxes, scores, score_threshold, nms_threshold):
     """
-    Non-Maximum Suppression that returns results in cv2.nmsboxes format
+    Direct replacement for cv2.dnn.NMSBoxes
     
     Returns:
-        indices: Flattened array of indices (same as cv2.nmsboxes output)
+        indices: Array that can be flattened (same as cv2.dnn.NMSBoxes output)
     """
-    keep_indices = nms_boxes(boxes, scores, score_threshold, nms_threshold)
-    return np.array(keep_indices).flatten()
+    return nms_boxes(boxes, scores, score_threshold, nms_threshold)
 
 
-# Example usage and test function
+# Example usage that matches your apply_nms function
 def test_nms():
-    """Test function to demonstrate usage"""
+    """Test function that demonstrates usage matching your code"""
     
     # Example boxes in [x, y, width, height] format
     boxes = [
@@ -97,22 +97,43 @@ def test_nms():
     ]
     
     scores = [0.9, 0.8, 0.95, 0.7, 0.85]
+    classes = [0, 0, 1, 0, 1]  # Example classes
     
-    score_threshold = 0.5
-    nms_threshold = 0.4
+    iou_threshold = 0.5
     
-    # Run NMS
-    keep_indices = nms_boxes(boxes, scores, score_threshold, nms_threshold)
-    print("Original boxes:", boxes)
-    print("Original scores:", scores)
-    print("Kept indices:", keep_indices)
-    print("Kept boxes:", [boxes[i] for i in keep_indices])
-    print("Kept scores:", [scores[i] for i in keep_indices])
+    # Simulate your apply_nms function logic
+    if len(boxes) == 0:
+        print("No boxes")
+        return [], [], []
     
-    # Test cv2 format
-    keep_indices_cv2 = nms_boxes_cv2_format(boxes, scores, score_threshold, nms_threshold)
-    print("CV2 format result:", keep_indices_cv2)
+    # Apply NMS - replace cv2.dnn.NMSBoxes with our function
+    indices = NMSBoxes(boxes, scores, 0.0, iou_threshold)
+    
+    if len(indices) > 0:
+        indices = indices.flatten()
+        kept_boxes = [boxes[i] for i in indices]
+        kept_scores = [scores[i] for i in indices] 
+        kept_classes = [classes[i] for i in indices]
+        
+        print("Original boxes:", boxes)
+        print("Original scores:", scores)
+        print("Kept indices:", indices)
+        print("Kept boxes:", kept_boxes)
+        print("Kept scores:", kept_scores)
+        print("Kept classes:", kept_classes)
+        
+        return kept_boxes, kept_scores, kept_classes
+    else:
+        print("No boxes kept after NMS")
+        return [], [], []
 
 
 if __name__ == "__main__":
     test_nms()
+    
+    print("\n" + "="*50)
+    print("USAGE: Replace this line in your apply_nms function:")
+    print("indices = cv2.dnn.NMSBoxes(boxes, scores, 0.0, iou_threshold)")
+    print("With:")
+    print("indices = NMSBoxes(boxes, scores, 0.0, iou_threshold)")
+    print("="*50)
