@@ -1,535 +1,190 @@
-# adapted from https://github.com/signatrix/efficientdet/blob/master/train.py
-# modified by Zylo117
-# Complete Ray Train multi-server distributed training
-
-import argparse
-import datetime
-import os
-import traceback
-import time
-
-import numpy as np
 import torch
+import torch.nn as nn
 import yaml
-
-from tensorboardX import SummaryWriter
-from torch import nn
-from torch.utils.data import DataLoader
-from torchvision import transforms
-from tqdm.autonotebook import tqdm
-
-# Ray imports
-import ray
-from ray import train
-from ray.train import Checkpoint, ScalingConfig
-from ray.train.torch import TorchTrainer
-import ray.train.torch as ray_torch
-
+import argparse
+import os
+from collections import OrderedDict
 from backbone import EfficientDetBackbone
-from efficientdet.dataset import CocoDataset, Resizer, Normalizer, Augmenter, collater
-from efficientdet.loss import FocalLoss
-from utils.sync_batchnorm import patch_replication_callback
-from utils.utils import replace_w_sync_bn, CustomDataParallel, get_last_weights, init_weights, boolean_string
+from efficientdet.utils import BBoxTransform, ClipBoxes
+import torchvision
 
-
-class Params:
-    def __init__(self, project_file):
-        self.params = yaml.safe_load(open(project_file).read())
-
-    def __getattr__(self, item):
-        return self.params.get(item, None)
-
-
-def get_args():
-    parser = argparse.ArgumentParser('EfficientDet Distributed Training with Ray')
-
-    # Original training arguments
-    parser.add_argument('-p', '--project', type=str, default='coco', help='project file that contains parameters')
-    parser.add_argument('-c', '--compound_coef', type=int, default=0, help='coefficients of efficientdet')
-    parser.add_argument('-n', '--num_workers', type=int, default=4, help='num_workers of dataloader per worker')
-    parser.add_argument('--batch_size', type=int, default=8, help='batch size per worker')
-    parser.add_argument('--head_only', type=boolean_string, default=False,
-                        help='whether finetunes only the regressor and the classifier')
-    parser.add_argument('--lr', type=float, default=1e-4)
-    parser.add_argument('--optim', type=str, default='adamw', help='optimizer: adamw or sgd')
-    parser.add_argument('--num_epochs', type=int, default=500)
-    parser.add_argument('--val_interval', type=int, default=1, help='validation interval')
-    parser.add_argument('--save_interval', type=int, default=100, help='checkpoint save interval')
-    parser.add_argument('--es_min_delta', type=float, default=0.0, help='early stopping min delta')
-    parser.add_argument('--es_patience', type=int, default=0, help='early stopping patience')
-    parser.add_argument('--data_path', type=str, default='datasets/', help='dataset root folder')
-    parser.add_argument('--log_path', type=str, default='logs/')
-    parser.add_argument('--load_weights', type=str, default=None, help='checkpoint path')
-    parser.add_argument('--saved_path', type=str, default='logs/')
-    parser.add_argument('--debug', type=boolean_string, default=False)
+# CRITICAL FIX 1: Replace batched_nms before importing
+def onnx_batched_nms(boxes, scores, idxs, iou_threshold):
+    """ONNX-compatible batched NMS implementation"""
+    if boxes.numel() == 0:
+        return torch.empty((0,), dtype=torch.long, device=boxes.device)
     
-    # Ray distributed training arguments
-    parser.add_argument('--num_workers_total', type=int, default=4, help='Total number of distributed workers')
-    parser.add_argument('--use_gpu', type=boolean_string, default=True, help='Use GPU for training')
-    parser.add_argument('--ray_address', type=str, default=None, help='Ray head node address (None for local)')
-    parser.add_argument('--cpus_per_worker', type=float, default=2.0, help='CPUs per worker')
-    parser.add_argument('--gpus_per_worker', type=float, default=1.0, help='GPUs per worker')
+    # Convert to format expected by torchvision.ops.nms
+    max_coordinate = boxes.max()
+    offsets = idxs.to(boxes) * (max_coordinate + torch.tensor(1).to(boxes))
+    boxes_for_nms = boxes + offsets[:, None]
     
-    args = parser.parse_args()
-    return args
+    keep = torchvision.ops.nms(boxes_for_nms, scores, iou_threshold)
+    return keep
 
+# Replace the problematic batched_nms
+torchvision.ops.batched_nms = onnx_batched_nms
 
-class ModelWithLoss(nn.Module):
-    def __init__(self, model, debug=False):
+class EfficientDetWithProperPostProcess(nn.Module):
+    def __init__(self, backbone, score_threshold=0.05, nms_threshold=0.5, max_detections=100):
         super().__init__()
-        self.criterion = FocalLoss()
-        self.model = model
-        self.debug = debug
+        self.backbone = backbone
+        self.score_threshold = score_threshold
+        self.nms_threshold = nms_threshold
+        self.max_detections = max_detections
+        self.regressBoxes = BBoxTransform()
+        self.clipBoxes = ClipBoxes()
+    
+    def forward(self, x):
+        features, regression, classification, anchors = self.backbone(x)
+        
+        # CRITICAL FIX 2: Proper postprocessing pipeline
+        batch_size = x.shape[0]
+        
+        # Transform and clip boxes
+        transformed_anchors = self.regressBoxes(anchors, regression)
+        transformed_anchors = self.clipBoxes(transformed_anchors, x)
+        
+        # Apply sigmoid to get probabilities
+        classification_scores = torch.sigmoid(classification)
+        
+        results_boxes = []
+        results_scores = []
+        results_classes = []
+        
+        for i in range(batch_size):
+            # Get scores and find those above threshold
+            scores = torch.max(classification_scores[i], dim=1)[0]
+            scores_over_thresh = scores > self.score_threshold
+            
+            if scores_over_thresh.sum() == 0:
+                # No detections above threshold
+                results_boxes.append(torch.zeros((0, 4), device=x.device))
+                results_scores.append(torch.zeros((0,), device=x.device))
+                results_classes.append(torch.zeros((0,), device=x.device, dtype=torch.long))
+                continue
+            
+            # Filter boxes, scores and get class predictions
+            classification_per = classification_scores[i, scores_over_thresh, :]
+            transformed_anchors_per = transformed_anchors[i, scores_over_thresh, :]
+            scores_per = scores[scores_over_thresh]
+            
+            # Get class with highest score for each detection
+            anchors_class_scores, anchors_class_ids = torch.max(classification_per, dim=1)
+            
+            # CRITICAL FIX 3: Proper batched NMS instead of top-k
+            try:
+                anchors_nms_idx = torchvision.ops.batched_nms(
+                    transformed_anchors_per, 
+                    anchors_class_scores, 
+                    anchors_class_ids, 
+                    self.nms_threshold
+                )
+                
+                # Limit to max detections
+                if len(anchors_nms_idx) > self.max_detections:
+                    # Sort by score and keep top detections
+                    scores_sorted, sorted_indices = torch.sort(anchors_class_scores[anchors_nms_idx], descending=True)
+                    anchors_nms_idx = anchors_nms_idx[sorted_indices[:self.max_detections]]
+                
+            except Exception as e:
+                print(f"NMS failed, falling back to top-k: {e}")
+                # Fallback to top-k if NMS fails
+                _, anchors_nms_idx = torch.topk(anchors_class_scores, 
+                                              k=min(self.max_detections, len(anchors_class_scores)))
+            
+            if len(anchors_nms_idx) > 0:
+                results_boxes.append(transformed_anchors_per[anchors_nms_idx])
+                results_scores.append(anchors_class_scores[anchors_nms_idx])
+                results_classes.append(anchors_class_ids[anchors_nms_idx])
+            else:
+                results_boxes.append(torch.zeros((0, 4), device=x.device))
+                results_scores.append(torch.zeros((0,), device=x.device))
+                results_classes.append(torch.zeros((0,), device=x.device, dtype=torch.long))
+        
+        # CRITICAL FIX 4: Maintain batch dimension consistency
+        # Pad to same length for ONNX compatibility
+        max_dets = max(len(box) for box in results_boxes)
+        if max_dets == 0:
+            max_dets = 1  # Avoid empty tensors
+        
+        padded_boxes = torch.zeros((batch_size, max_dets, 4), device=x.device)
+        padded_scores = torch.zeros((batch_size, max_dets), device=x.device)
+        padded_classes = torch.zeros((batch_size, max_dets), device=x.device, dtype=torch.long)
+        
+        for i, (boxes, scores, classes) in enumerate(zip(results_boxes, results_scores, results_classes)):
+            if len(boxes) > 0:
+                padded_boxes[i, :len(boxes)] = boxes
+                padded_scores[i, :len(scores)] = scores
+                padded_classes[i, :len(classes)] = classes
+        
+        return padded_boxes, padded_scores, padded_classes
 
-    def forward(self, imgs, annotations, obj_list=None):
-        _, regression, classification, anchors = self.model(imgs)
-        if self.debug:
-            cls_loss, reg_loss = self.criterion(classification, regression, anchors, annotations,
-                                                imgs=imgs, obj_list=obj_list)
-        else:
-            cls_loss, reg_loss = self.criterion(classification, regression, anchors, annotations)
-        return cls_loss, reg_loss
-
-
-def train_func(config):
-    """
-    Training function that runs on each distributed worker
-    """
-    print(f"Worker starting on {ray_torch.get_device()}")
+def convert_to_onnx_fixed(project_file, weights_path, output_path, compound_coef=2, 
+                         score_threshold=0.05, nms_threshold=0.5, max_detections=100):
+    device = torch.device('cpu')
     
-    # Get distributed training info
-    world_rank = train.get_context().get_world_rank()
-    world_size = train.get_context().get_world_size()
-    local_rank = train.get_context().get_local_rank()
+    class Params:
+        def __init__(self, project_file):
+            self.params = yaml.safe_load(open(project_file).read())
+        def __getattr__(self, item):
+            return self.params.get(item, None)
     
-    print(f"Worker {world_rank}/{world_size} (local_rank: {local_rank}) starting...")
-    
-    # Load parameters
-    params = Params(f'projects/{config["project"]}.yml')
-    
-    # Setup paths
-    saved_path = config['saved_path'] + f'/{params.project_name}/'
-    log_path = config['log_path'] + f'/{params.project_name}/tensorboard/'
-    
-    # Create directories only on rank 0
-    if world_rank == 0:
-        os.makedirs(log_path, exist_ok=True)
-        os.makedirs(saved_path, exist_ok=True)
-        print(f"Created directories: {saved_path}, {log_path}")
-    
-    # Verify dataset exists on this worker
-    dataset_path = os.path.join(config['data_path'], params.project_name)
-    if not os.path.exists(dataset_path):
-        raise FileNotFoundError(f"Dataset not found at {dataset_path} on worker {world_rank}")
-    
-    print(f"Worker {world_rank}: Dataset found at {dataset_path}")
-
-    # Data loading parameters - reduce batch size per worker for distributed training
-    per_worker_batch_size = max(1, config['batch_size'] // world_size)
-    
-    training_params = {
-        'batch_size': per_worker_batch_size,
-        'shuffle': True,
-        'drop_last': True,
-        'collate_fn': collater,
-        'num_workers': config['num_workers'],
-        'pin_memory': True
-    }
-
-    val_params = {
-        'batch_size': per_worker_batch_size,
-        'shuffle': False,
-        'drop_last': True,
-        'collate_fn': collater,
-        'num_workers': config['num_workers'],
-        'pin_memory': True
-    }
-
+    params = Params(project_file)
     input_sizes = [512, 640, 768, 896, 1024, 1280, 1280, 1536, 1536]
+    input_size = input_sizes[compound_coef]
     
-    # Create datasets
-    print(f"Worker {world_rank}: Creating datasets...")
-    training_set = CocoDataset(
-        root_dir=dataset_path,
-        set=params.train_set,
-        transform=transforms.Compose([
-            Normalizer(mean=params.mean, std=params.std),
-            Augmenter(),
-            Resizer(input_sizes[config['compound_coef']])
-        ])
-    )
+    print(f"Loading model with {len(params.obj_list)} classes, compound_coef={compound_coef}")
     
-    val_set = CocoDataset(
-        root_dir=dataset_path,
-        set=params.val_set,
-        transform=transforms.Compose([
-            Normalizer(mean=params.mean, std=params.std),
-            Resizer(input_sizes[config['compound_coef']])
-        ])
-    )
-
-    print(f"Worker {world_rank}: Training set size: {len(training_set)}, Val set size: {len(val_set)}")
-
-    # Create data loaders
-    training_loader = DataLoader(training_set, **training_params)
-    val_loader = DataLoader(val_set, **val_params)
-
-    # Prepare distributed data loaders
-    training_generator = ray_torch.prepare_data_loader(training_loader)
-    val_generator = ray_torch.prepare_data_loader(val_loader)
-
-    # Create model
-    print(f"Worker {world_rank}: Creating model...")
-    model = EfficientDetBackbone(
-        num_classes=len(params.obj_list),
-        compound_coef=config['compound_coef'],
-        ratios=eval(params.anchors_ratios),
+    # Create backbone model
+    backbone = EfficientDetBackbone(
+        num_classes=len(params.obj_list), 
+        compound_coef=compound_coef, 
+        onnx_export=True,
+        ratios=eval(params.anchors_ratios), 
         scales=eval(params.anchors_scales)
-    )
-
+    ).to(device)
+    
+    # CRITICAL FIX 5: Proper Swish handling
+    backbone.backbone_net.model.set_swish(memory_efficient=False)
+    
     # Load weights
-    last_step = 0
-    start_epoch = 0
-    if config['load_weights'] is not None:
-        try:
-            if config['load_weights'].endswith('.pth'):
-                weights_path = config['load_weights']
-            else:
-                weights_path = get_last_weights(saved_path)
-            
-            if os.path.exists(weights_path):
-                checkpoint_data = torch.load(weights_path, map_location='cpu')
-                
-                if isinstance(checkpoint_data, dict) and 'model_state_dict' in checkpoint_data:
-                    model.load_state_dict(checkpoint_data['model_state_dict'], strict=False)
-                    last_step = checkpoint_data.get('step', 0)
-                    start_epoch = checkpoint_data.get('epoch', 0)
-                else:
-                    model.load_state_dict(checkpoint_data, strict=False)
-                    try:
-                        last_step = int(os.path.basename(weights_path).split('_')[-1].split('.')[0])
-                    except:
-                        last_step = 0
-                
-                if world_rank == 0:
-                    print(f'[Info] Loaded weights: {weights_path}, resuming from step: {last_step}, epoch: {start_epoch}')
-            else:
-                if world_rank == 0:
-                    print(f'[Warning] Weights file not found: {weights_path}')
-        except Exception as e:
-            if world_rank == 0:
-                print(f'[Warning] Error loading weights: {e}')
-    else:
-        if world_rank == 0:
-            print('[Info] Initializing weights...')
-        init_weights(model)
-
-    # Freeze backbone if head_only
-    if config['head_only']:
-        def freeze_backbone(m):
-            classname = m.__class__.__name__
-            for ntl in ['EfficientNet', 'BiFPN']:
-                if ntl in classname:
-                    for param in m.parameters():
-                        param.requires_grad = False
-        model.apply(freeze_backbone)
-        if world_rank == 0:
-            print('[Info] Froze backbone')
-
-    # Wrap model with loss
-    model = ModelWithLoss(model, debug=config['debug'])
-
-    # Prepare model for distributed training
-    model = ray_torch.prepare_model(model)
-
-    # Setup optimizer with scaled learning rate for distributed training
-    scaled_lr = config['lr'] * world_size
-    if config['optim'] == 'adamw':
-        optimizer = torch.optim.AdamW(model.parameters(), scaled_lr)
-    else:
-        optimizer = torch.optim.SGD(model.parameters(), scaled_lr, momentum=0.9, nesterov=True)
-
-    # Prepare optimizer
-    optimizer = ray_torch.prepare_optimizer(optimizer)
+    print(f"Loading weights from: {weights_path}")
+    backbone.load_state_dict(torch.load(weights_path, map_location=device))
     
-    # Setup scheduler
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=3, verbose=(world_rank == 0))
-
-    # Setup tensorboard writer (only on rank 0)
-    writer = None
-    if world_rank == 0:
-        writer = SummaryWriter(log_path + f'{datetime.datetime.now().strftime("%Y%m%d-%H%M%S")}')
-
-    # Training loop
-    best_loss = 1e5
-    best_epoch = 0
-    step = max(0, last_step)
-    num_iter_per_epoch = len(training_generator)
-
-    if world_rank == 0:
-        print(f"Starting training from epoch {start_epoch}, step {step}")
-        print(f"Iterations per epoch: {num_iter_per_epoch}")
-        print(f"Per-worker batch size: {per_worker_batch_size}")
-        print(f"Effective global batch size: {per_worker_batch_size * world_size}")
-
-    try:
-        for epoch in range(start_epoch, config['num_epochs']):
-            model.train()
-            epoch_loss = []
-            
-            # Create progress bar only on rank 0
-            if world_rank == 0:
-                progress_bar = tqdm(training_generator, desc=f'Epoch {epoch}/{config["num_epochs"]}')
-            else:
-                progress_bar = training_generator
-
-            # Training phase
-            for iter_idx, data in enumerate(progress_bar):
-                imgs = data['img']
-                annot = data['annot']
-
-                optimizer.zero_grad()
-                cls_loss, reg_loss = model(imgs, annot, obj_list=params.obj_list)
-                cls_loss = cls_loss.mean()
-                reg_loss = reg_loss.mean()
-                loss = cls_loss + reg_loss
-
-                if loss == 0 or not torch.isfinite(loss):
-                    continue
-
-                loss.backward()
-                # Gradient clipping
-                torch.nn.utils.clip_grad_norm_(model.parameters(), 0.1)
-                optimizer.step()
-
-                epoch_loss.append(float(loss))
-                
-                # Update progress bar
-                if world_rank == 0 and hasattr(progress_bar, 'set_postfix'):
-                    progress_bar.set_postfix({
-                        'cls_loss': f'{cls_loss:.4f}',
-                        'reg_loss': f'{reg_loss:.4f}',
-                        'total_loss': f'{loss:.4f}',
-                        'lr': f'{optimizer.param_groups[0]["lr"]:.6f}'
-                    })
-
-                # Log metrics (only rank 0)
-                if world_rank == 0 and writer and step % 10 == 0:
-                    writer.add_scalar('Loss/train', loss, step)
-                    writer.add_scalar('Loss/cls_train', cls_loss, step)
-                    writer.add_scalar('Loss/reg_train', reg_loss, step)
-                    writer.add_scalar('Learning_Rate', optimizer.param_groups[0]['lr'], step)
-
-                step += 1
-
-                # Save checkpoint
-                if step % config['save_interval'] == 0 and step > 0 and world_rank == 0:
-                    checkpoint_data = {
-                        "model_state_dict": model.module.model.state_dict(),
-                        "optimizer_state_dict": optimizer.state_dict(),
-                        "epoch": epoch,
-                        "step": step,
-                        "best_loss": best_loss
-                    }
-                    
-                    # Save to file
-                    checkpoint_name = f'efficientdet-d{config["compound_coef"]}_epoch_{epoch}_step_{step}.pth'
-                    torch.save(checkpoint_data, os.path.join(saved_path, checkpoint_name))
-                    
-                    # Ray checkpoint
-                    checkpoint = Checkpoint.from_dict(checkpoint_data)
-                    train.report({"step": step, "checkpoint_saved": True}, checkpoint=checkpoint)
-
-            # Calculate average epoch loss
-            avg_epoch_loss = np.mean(epoch_loss) if epoch_loss else float('inf')
-            scheduler.step(avg_epoch_loss)
-
-            # Validation phase
-            if epoch % config['val_interval'] == 0:
-                model.eval()
-                val_cls_losses = []
-                val_reg_losses = []
-
-                with torch.no_grad():
-                    val_progress = val_generator
-                    if world_rank == 0:
-                        val_progress = tqdm(val_generator, desc='Validation')
-                    
-                    for data in val_progress:
-                        imgs = data['img']
-                        annot = data['annot']
-
-                        cls_loss, reg_loss = model(imgs, annot, obj_list=params.obj_list)
-                        cls_loss = cls_loss.mean()
-                        reg_loss = reg_loss.mean()
-                        loss = cls_loss + reg_loss
-                        
-                        if loss == 0 or not torch.isfinite(loss):
-                            continue
-
-                        val_cls_losses.append(cls_loss.item())
-                        val_reg_losses.append(reg_loss.item())
-
-                # Calculate validation metrics
-                val_cls_loss = np.mean(val_cls_losses) if val_cls_losses else float('inf')
-                val_reg_loss = np.mean(val_reg_losses) if val_reg_losses else float('inf')
-                val_loss = val_cls_loss + val_reg_loss
-
-                if world_rank == 0:
-                    print(f'\nEpoch {epoch}/{config["num_epochs"]}:')
-                    print(f'  Train Loss: {avg_epoch_loss:.5f}')
-                    print(f'  Val Loss: {val_loss:.5f} (cls: {val_cls_loss:.5f}, reg: {val_reg_loss:.5f})')
-
-                    if writer:
-                        writer.add_scalars('Loss/epoch', {
-                            'train': avg_epoch_loss,
-                            'val': val_loss
-                        }, epoch)
-                        writer.add_scalars('Val_Loss_Components', {
-                            'cls': val_cls_loss,
-                            'reg': val_reg_loss
-                        }, epoch)
-
-                # Report metrics to Ray Train
-                metrics = {
-                    "epoch": epoch,
-                    "step": step,
-                    "train_loss": avg_epoch_loss,
-                    "val_loss": val_loss,
-                    "val_cls_loss": val_cls_loss,
-                    "val_reg_loss": val_reg_loss,
-                    "learning_rate": optimizer.param_groups[0]['lr']
-                }
-                
-                # Check for best model
-                if val_loss + config['es_min_delta'] < best_loss:
-                    best_loss = val_loss
-                    best_epoch = epoch
-                    metrics["best_loss"] = best_loss
-                    metrics["is_best"] = True
-
-                    if world_rank == 0:
-                        best_checkpoint_data = {
-                            "model_state_dict": model.module.model.state_dict(),
-                            "optimizer_state_dict": optimizer.state_dict(),
-                            "epoch": epoch,
-                            "step": step,
-                            "best_loss": best_loss
-                        }
-                        
-                        # Save best model
-                        best_model_name = f'efficientdet-d{config["compound_coef"]}_best.pth'
-                        torch.save(best_checkpoint_data, os.path.join(saved_path, best_model_name))
-                        
-                        checkpoint = Checkpoint.from_dict(best_checkpoint_data)
-                        train.report(metrics, checkpoint=checkpoint)
-                        print(f'  New best model saved! Loss: {best_loss:.5f}')
-                else:
-                    train.report(metrics)
-
-                # Early stopping
-                if epoch - best_epoch > config['es_patience'] > 0:
-                    if world_rank == 0:
-                        print(f'Early stopping at epoch {epoch}. Best loss: {best_loss:.5f}')
-                    break
-
-    except KeyboardInterrupt:
-        if world_rank == 0:
-            print("Training interrupted by user")
-    except Exception as e:
-        if world_rank == 0:
-            print(f"Training error: {e}")
-            traceback.print_exc()
-    finally:
-        if world_rank == 0 and writer:
-            writer.close()
-            print("Training completed!")
-
-
-def main():
-    args = get_args()
+    # Create model with proper postprocessing
+    model = EfficientDetWithProperPostProcess(backbone, score_threshold, nms_threshold, max_detections)
+    model.eval()
     
-    print("=== EfficientDet Distributed Training Setup ===")
-    print(f"Project: {args.project}")
-    print(f"Compound Coefficient: {args.compound_coef}")
-    print(f"Total Workers: {args.num_workers_total}")
-    print(f"Batch Size per Worker: {args.batch_size}")
-    print(f"Ray Address: {args.ray_address or 'Local'}")
-    print("=" * 50)
+    # Create dummy input
+    dummy_input = torch.randn((1, 3, input_size, input_size), dtype=torch.float32).to(device)
     
-    # Initialize Ray
-    if args.ray_address:
-        print(f"Connecting to Ray cluster at {args.ray_address}")
-        ray.init(address=args.ray_address)
-    else:
-        print("Starting local Ray cluster")
-        ray.init()
+    print(f"Converting to ONNX with proper postprocessing")
     
-    # Verify cluster
-    print(f"Ray cluster nodes: {len(ray.nodes())}")
-    print(f"Available resources: {ray.cluster_resources()}")
-
-    # Training configuration
-    train_config = {
-        "project": args.project,
-        "compound_coef": args.compound_coef,
-        "num_workers": args.num_workers,
-        "batch_size": args.batch_size,
-        "head_only": args.head_only,
-        "lr": args.lr,
-        "optim": args.optim,
-        "num_epochs": args.num_epochs,
-        "val_interval": args.val_interval,
-        "save_interval": args.save_interval,
-        "es_min_delta": args.es_min_delta,
-        "es_patience": args.es_patience,
-        "data_path": args.data_path,
-        "log_path": args.log_path,
-        "load_weights": args.load_weights,
-        "saved_path": args.saved_path,
-        "debug": args.debug
-    }
-
-    # Ray Train scaling configuration
-    scaling_config = ScalingConfig(
-        num_workers=args.num_workers_total,
-        use_gpu=args.use_gpu,
-        resources_per_worker={
-            "CPU": args.cpus_per_worker,
-            "GPU": args.gpus_per_worker if args.use_gpu else 0
-        }
+    # CRITICAL FIX 6: Proper export settings
+    torch.onnx.export(
+        model, 
+        dummy_input, 
+        output_path,
+        verbose=False,  # Reduce verbose output
+        input_names=['input'],
+        output_names=['boxes', 'scores', 'classes'],
+        opset_version=11,  # Use stable opset
+        do_constant_folding=True,
+        dynamic_axes={
+            'input': {0: 'batch_size'},
+            'boxes': {0: 'batch_size', 1: 'num_detections'},
+            'scores': {0: 'batch_size', 1: 'num_detections'},
+            'classes': {0: 'batch_size', 1: 'num_detections'}
+        },
+        # CRITICAL: Add these export params
+        keep_initializers_as_inputs=False,
+        export_params=True,
     )
-
-    # Create TorchTrainer
-    trainer = TorchTrainer(
-        train_loop_per_worker=train_func,
-        train_loop_config=train_config,
-        scaling_config=scaling_config
-    )
-
-    print("Starting distributed training...")
-    start_time = time.time()
     
-    try:
-        # Start training
-        result = trainer.fit()
-        
-        training_time = time.time() - start_time
-        print(f"\n🎉 Training completed successfully!")
-        print(f"⏱️  Total training time: {training_time/3600:.2f} hours")
-        print(f"📊 Final metrics: {result.metrics}")
-        
-        if result.checkpoint:
-            print(f"💾 Best checkpoint saved")
-            
-    except Exception as e:
-        print(f"❌ Training failed: {e}")
-        traceback.print_exc()
-    finally:
-        # Shutdown Ray
-        ray.shutdown()
-        print("Ray cluster shutdown complete")
-
+    print(f"ONNX model with proper postprocessing saved to: {output_path}")
 
 if __name__ == '__main__':
-    main()
+    # Your existing argument parsing code here
+    convert_to_onnx_fixed('projects/abhil.yml', 'path/to/your/weights.pth', 'efficientdet_fixed.onnx', 
+                         compound_coef=2, score_threshold=0.05, nms_threshold=0.5, max_detections=100)
