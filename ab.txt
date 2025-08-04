@@ -1,190 +1,121 @@
-import torch
-import torch.nn as nn
-import yaml
-import argparse
+import json
 import os
-from collections import OrderedDict
-from backbone import EfficientDetBackbone
-from efficientdet.utils import BBoxTransform, ClipBoxes
-import torchvision
+import argparse
+import numpy as np
+import yaml
+from tqdm import tqdm
+import onnxruntime as ort
 
-# CRITICAL FIX 1: Replace batched_nms before importing
-def onnx_batched_nms(boxes, scores, idxs, iou_threshold):
-    """ONNX-compatible batched NMS implementation"""
-    if boxes.numel() == 0:
-        return torch.empty((0,), dtype=torch.long, device=boxes.device)
-    
-    # Convert to format expected by torchvision.ops.nms
-    max_coordinate = boxes.max()
-    offsets = idxs.to(boxes) * (max_coordinate + torch.tensor(1).to(boxes))
-    boxes_for_nms = boxes + offsets[:, None]
-    
-    keep = torchvision.ops.nms(boxes_for_nms, scores, iou_threshold)
-    return keep
+from pycocotools.coco import COCO
+from pycocotools.cocoeval import COCOeval
+from utils.utils import preprocess, invert_affine, boolean_string
 
-# Replace the problematic batched_nms
-torchvision.ops.batched_nms = onnx_batched_nms
+class ONNXEfficientDetFixed:
+    def __init__(self, model_path, device='cpu'):
+        self.device = device
+        providers = ['CUDAExecutionProvider', 'CPUExecutionProvider'] if device == 'cuda' else ['CPUExecutionProvider']
+        self.session = ort.InferenceSession(model_path, providers=providers)
+        
+        self.input_name = self.session.get_inputs()[0].name
+        self.output_names = [output.name for output in self.session.get_outputs()]
+    
+    def predict(self, image_tensor):
+        if hasattr(image_tensor, 'numpy'):
+            image_np = image_tensor.numpy()
+        else:
+            image_np = image_tensor
+            
+        outputs = self.session.run(self.output_names, {self.input_name: image_np})
+        return outputs[0], outputs[1], outputs[2]  # boxes, scores, classes
 
-class EfficientDetWithProperPostProcess(nn.Module):
-    def __init__(self, backbone, score_threshold=0.05, nms_threshold=0.5, max_detections=100):
-        super().__init__()
-        self.backbone = backbone
-        self.score_threshold = score_threshold
-        self.nms_threshold = nms_threshold
-        self.max_detections = max_detections
-        self.regressBoxes = BBoxTransform()
-        self.clipBoxes = ClipBoxes()
-    
-    def forward(self, x):
-        features, regression, classification, anchors = self.backbone(x)
-        
-        # CRITICAL FIX 2: Proper postprocessing pipeline
-        batch_size = x.shape[0]
-        
-        # Transform and clip boxes
-        transformed_anchors = self.regressBoxes(anchors, regression)
-        transformed_anchors = self.clipBoxes(transformed_anchors, x)
-        
-        # Apply sigmoid to get probabilities
-        classification_scores = torch.sigmoid(classification)
-        
-        results_boxes = []
-        results_scores = []
-        results_classes = []
-        
-        for i in range(batch_size):
-            # Get scores and find those above threshold
-            scores = torch.max(classification_scores[i], dim=1)[0]
-            scores_over_thresh = scores > self.score_threshold
-            
-            if scores_over_thresh.sum() == 0:
-                # No detections above threshold
-                results_boxes.append(torch.zeros((0, 4), device=x.device))
-                results_scores.append(torch.zeros((0,), device=x.device))
-                results_classes.append(torch.zeros((0,), device=x.device, dtype=torch.long))
-                continue
-            
-            # Filter boxes, scores and get class predictions
-            classification_per = classification_scores[i, scores_over_thresh, :]
-            transformed_anchors_per = transformed_anchors[i, scores_over_thresh, :]
-            scores_per = scores[scores_over_thresh]
-            
-            # Get class with highest score for each detection
-            anchors_class_scores, anchors_class_ids = torch.max(classification_per, dim=1)
-            
-            # CRITICAL FIX 3: Proper batched NMS instead of top-k
-            try:
-                anchors_nms_idx = torchvision.ops.batched_nms(
-                    transformed_anchors_per, 
-                    anchors_class_scores, 
-                    anchors_class_ids, 
-                    self.nms_threshold
-                )
-                
-                # Limit to max detections
-                if len(anchors_nms_idx) > self.max_detections:
-                    # Sort by score and keep top detections
-                    scores_sorted, sorted_indices = torch.sort(anchors_class_scores[anchors_nms_idx], descending=True)
-                    anchors_nms_idx = anchors_nms_idx[sorted_indices[:self.max_detections]]
-                
-            except Exception as e:
-                print(f"NMS failed, falling back to top-k: {e}")
-                # Fallback to top-k if NMS fails
-                _, anchors_nms_idx = torch.topk(anchors_class_scores, 
-                                              k=min(self.max_detections, len(anchors_class_scores)))
-            
-            if len(anchors_nms_idx) > 0:
-                results_boxes.append(transformed_anchors_per[anchors_nms_idx])
-                results_scores.append(anchors_class_scores[anchors_nms_idx])
-                results_classes.append(anchors_class_ids[anchors_nms_idx])
-            else:
-                results_boxes.append(torch.zeros((0, 4), device=x.device))
-                results_scores.append(torch.zeros((0,), device=x.device))
-                results_classes.append(torch.zeros((0,), device=x.device, dtype=torch.long))
-        
-        # CRITICAL FIX 4: Maintain batch dimension consistency
-        # Pad to same length for ONNX compatibility
-        max_dets = max(len(box) for box in results_boxes)
-        if max_dets == 0:
-            max_dets = 1  # Avoid empty tensors
-        
-        padded_boxes = torch.zeros((batch_size, max_dets, 4), device=x.device)
-        padded_scores = torch.zeros((batch_size, max_dets), device=x.device)
-        padded_classes = torch.zeros((batch_size, max_dets), device=x.device, dtype=torch.long)
-        
-        for i, (boxes, scores, classes) in enumerate(zip(results_boxes, results_scores, results_classes)):
-            if len(boxes) > 0:
-                padded_boxes[i, :len(boxes)] = boxes
-                padded_scores[i, :len(scores)] = scores
-                padded_classes[i, :len(classes)] = classes
-        
-        return padded_boxes, padded_scores, padded_classes
-
-def convert_to_onnx_fixed(project_file, weights_path, output_path, compound_coef=2, 
-                         score_threshold=0.05, nms_threshold=0.5, max_detections=100):
-    device = torch.device('cpu')
-    
-    class Params:
-        def __init__(self, project_file):
-            self.params = yaml.safe_load(open(project_file).read())
-        def __getattr__(self, item):
-            return self.params.get(item, None)
-    
-    params = Params(project_file)
+def evaluate_onnx_coco_fixed(img_path, set_name, image_ids, coco, model, compound_coef, params):
+    results = []
     input_sizes = [512, 640, 768, 896, 1024, 1280, 1280, 1536, 1536]
-    input_size = input_sizes[compound_coef]
     
-    print(f"Loading model with {len(params.obj_list)} classes, compound_coef={compound_coef}")
-    
-    # Create backbone model
-    backbone = EfficientDetBackbone(
-        num_classes=len(params.obj_list), 
-        compound_coef=compound_coef, 
-        onnx_export=True,
-        ratios=eval(params.anchors_ratios), 
-        scales=eval(params.anchors_scales)
-    ).to(device)
-    
-    # CRITICAL FIX 5: Proper Swish handling
-    backbone.backbone_net.model.set_swish(memory_efficient=False)
-    
-    # Load weights
-    print(f"Loading weights from: {weights_path}")
-    backbone.load_state_dict(torch.load(weights_path, map_location=device))
-    
-    # Create model with proper postprocessing
-    model = EfficientDetWithProperPostProcess(backbone, score_threshold, nms_threshold, max_detections)
-    model.eval()
-    
-    # Create dummy input
-    dummy_input = torch.randn((1, 3, input_size, input_size), dtype=torch.float32).to(device)
-    
-    print(f"Converting to ONNX with proper postprocessing")
-    
-    # CRITICAL FIX 6: Proper export settings
-    torch.onnx.export(
-        model, 
-        dummy_input, 
-        output_path,
-        verbose=False,  # Reduce verbose output
-        input_names=['input'],
-        output_names=['boxes', 'scores', 'classes'],
-        opset_version=11,  # Use stable opset
-        do_constant_folding=True,
-        dynamic_axes={
-            'input': {0: 'batch_size'},
-            'boxes': {0: 'batch_size', 1: 'num_detections'},
-            'scores': {0: 'batch_size', 1: 'num_detections'},
-            'classes': {0: 'batch_size', 1: 'num_detections'}
-        },
-        # CRITICAL: Add these export params
-        keep_initializers_as_inputs=False,
-        export_params=True,
-    )
-    
-    print(f"ONNX model with proper postprocessing saved to: {output_path}")
+    for image_id in tqdm(image_ids):
+        image_info = coco.loadImgs(image_id)[0]
+        image_path = img_path + image_info['file_name']
 
-if __name__ == '__main__':
-    # Your existing argument parsing code here
-    convert_to_onnx_fixed('projects/abhil.yml', 'path/to/your/weights.pth', 'efficientdet_fixed.onnx', 
-                         compound_coef=2, score_threshold=0.05, nms_threshold=0.5, max_detections=100)
+        # CRITICAL FIX 7: Use exact same preprocessing as original
+        ori_imgs, framed_imgs, framed_metas = preprocess(
+            [image_path],  # Note: preprocess expects list
+            max_size=input_sizes[compound_coef],
+            mean=params['mean'],
+            std=params['std']
+        )
+
+        # Prepare input for ONNX
+        x = framed_imgs[0]
+        x = np.expand_dims(x, axis=0)
+        x = np.transpose(x, (0, 3, 1, 2))
+
+        # Run ONNX inference
+        boxes, scores, classes = model.predict(x)
+        
+        # Remove batch dimension and padding
+        boxes = boxes[0]  # Remove batch dim
+        scores = scores[0] 
+        classes = classes[0]
+        
+        # Remove padded detections (score = 0)
+        valid_mask = scores > 0
+        if not valid_mask.any():
+            continue
+            
+        final_boxes = boxes[valid_mask]
+        final_scores = scores[valid_mask]
+        final_classes = classes[valid_mask]
+
+        # CRITICAL FIX 8: Proper coordinate transformation
+        try:
+            # Create predictions in exact same format as original
+            preds = [{
+                'rois': final_boxes,
+                'scores': final_scores,
+                'class_ids': final_classes
+            }]
+            
+            # Use the same invert_affine function
+            preds = invert_affine(framed_metas, preds)[0]
+            
+            final_boxes = preds['rois']
+            final_scores = preds['scores']
+            final_classes = preds['class_ids']
+            
+        except Exception as e:
+            print(f"Coordinate transformation failed for image {image_id}: {e}")
+            continue
+
+        # Process results in COCO format
+        for i in range(len(final_boxes)):
+            box = final_boxes[i]
+            score = float(final_scores[i])
+            class_id = int(final_classes[i])
+            
+            # Convert [x1,y1,x2,y2] to [x,y,w,h] for COCO format
+            x1, y1, x2, y2 = box
+            width = x2 - x1
+            height = y2 - y1
+            
+            if width <= 0 or height <= 0:
+                continue
+                
+            image_result = {
+                'image_id': image_id,
+                'category_id': class_id + 1,  # COCO categories start from 1
+                'score': score,
+                'bbox': [float(x1), float(y1), float(width), float(height)],
+            }
+            results.append(image_result)
+
+    if not len(results):
+        raise Exception("No valid detections found")
+
+    # Write output
+    filepath = f'{set_name}_bbox_results_onnx_fixed.json'
+    if os.path.exists(filepath):
+        os.remove(filepath)
+    json.dump(results, open(filepath, 'w'), indent=4)
+    return filepath
+
+# Rest of evaluation code remains the same...
