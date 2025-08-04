@@ -1,37 +1,39 @@
-# =============================================================================
-# CRITICAL ISSUES IDENTIFIED AND FIXES FOR YOUR EFFICIENTDET ONNX CONVERSION
-# =============================================================================
-
 """
-Key Problems Found:
-1. Top-K selection instead of proper NMS (MAJOR accuracy killer)
-2. Missing proper postprocessing pipeline 
-3. Incomplete coordinate transformation in evaluation
-4. Batch dimension handling issues
-5. Classification score processing differences
-"""
+ALTERNATIVE NMS APPROACHES FOR MAXIMUM ACCURACY
 
-# =============================================================================
-# FIX 1: IMPROVED ONNX CONVERSION WITH PROPER NMS-LIKE PROCESSING
-# =============================================================================
+Option 1: Hybrid approach - ONNX for inference, CPU NMS for postprocessing
+Option 2: TensorRT EfficientNMS plugin (NVIDIA GPUs only)
+Option 3: ONNX built-in NonMaxSuppression operator
+"""
 
 import torch
 import torch.nn as nn
-import yaml
-import argparse
-import os
 import numpy as np
-from collections import OrderedDict
+import yaml
+import json
+import os
+from tqdm import tqdm
+import onnxruntime as ort
+from torchvision.ops import nms, batched_nms
+from pycocotools.coco import COCO
+from pycocotools.cocoeval import COCOeval
+from utils.utils import preprocess, invert_affine, boolean_string
 from backbone import EfficientDetBackbone
 from efficientdet.utils import BBoxTransform, ClipBoxes
 
-class EfficientDetWithPostProcess(nn.Module):
-    def __init__(self, backbone, score_threshold=0.05, nms_threshold=0.5, max_detections=100):
+# =============================================================================
+# OPTION 1: HYBRID APPROACH - ONNX INFERENCE + CPU NMS (RECOMMENDED)
+# =============================================================================
+
+class EfficientDetONNXOnly(nn.Module):
+    """
+    Export only the backbone + postprocessing to ONNX, do NMS on CPU
+    This gives the best accuracy since we use the exact same NMS as PyTorch
+    """
+    def __init__(self, backbone, score_threshold=0.05):
         super().__init__()
         self.backbone = backbone
         self.score_threshold = score_threshold
-        self.nms_threshold = nms_threshold
-        self.max_detections = max_detections
         self.regressBoxes = BBoxTransform()
         self.clipBoxes = ClipBoxes()
     
@@ -42,126 +44,154 @@ class EfficientDetWithPostProcess(nn.Module):
         transformed_anchors = self.regressBoxes(anchors, regression)
         transformed_anchors = self.clipBoxes(transformed_anchors, x)
         
-        # CRITICAL FIX: Proper classification score handling
-        # The original model applies sigmoid in Classifier.forward()
-        # Make sure we're consistent with the original implementation
-        if not hasattr(classification, '_sigmoid_applied'):
-            classification_scores = torch.sigmoid(classification)
-        else:
-            classification_scores = classification
-        
-        # Get max score per anchor and corresponding class
-        scores, classes = torch.max(classification_scores, dim=2)
-        
-        # Apply score threshold
-        score_mask = scores > self.score_threshold
-        
-        # CRITICAL FIX: Better NMS approximation for ONNX
-        # Instead of simple top-k, implement a more sophisticated filtering
-        batch_size = scores.shape[0]
-        final_boxes_list = []
-        final_scores_list = []
-        final_classes_list = []
-        
-        for batch_idx in range(batch_size):
-            # Get valid detections for this batch
-            valid_mask = score_mask[batch_idx]
-            if not valid_mask.any():
-                # Return empty results if no valid detections
-                final_boxes_list.append(torch.zeros(0, 4))
-                final_scores_list.append(torch.zeros(0))
-                final_classes_list.append(torch.zeros(0))
-                continue
-                
-            batch_boxes = transformed_anchors[batch_idx][valid_mask]
-            batch_scores = scores[batch_idx][valid_mask]
-            batch_classes = classes[batch_idx][valid_mask]
-            
-            # IMPROVED: Class-wise top-k selection (better than global top-k)
-            # This approximates NMS behavior better by considering each class separately
-            unique_classes = torch.unique(batch_classes)
-            keep_boxes = []
-            keep_scores = []
-            keep_classes = []
-            
-            for cls in unique_classes:
-                cls_mask = batch_classes == cls
-                cls_boxes = batch_boxes[cls_mask]
-                cls_scores = batch_scores[cls_mask]
-                
-                # Sort by score and take top detections per class
-                max_per_class = min(50, cls_scores.shape[0])  # Limit per class
-                _, indices = torch.topk(cls_scores, k=max_per_class)
-                
-                keep_boxes.append(cls_boxes[indices])
-                keep_scores.append(cls_scores[indices])
-                keep_classes.append(torch.full((max_per_class,), cls, dtype=batch_classes.dtype))
-            
-            if keep_boxes:
-                all_boxes = torch.cat(keep_boxes, dim=0)
-                all_scores = torch.cat(keep_scores, dim=0)
-                all_classes = torch.cat(keep_classes, dim=0)
-                
-                # Final top-k selection across all classes
-                final_k = min(self.max_detections, all_scores.shape[0])
-                _, final_indices = torch.topk(all_scores, k=final_k)
-                
-                final_boxes_list.append(all_boxes[final_indices])
-                final_scores_list.append(all_scores[final_indices])
-                final_classes_list.append(all_classes[final_indices])
-            else:
-                final_boxes_list.append(torch.zeros(0, 4))
-                final_scores_list.append(torch.zeros(0))
-                final_classes_list.append(torch.zeros(0))
-        
-        # CRITICAL FIX: Don't squeeze batch dimension too early
-        # Return in format that matches original expectations
-        if batch_size == 1:
-            return final_boxes_list[0], final_scores_list[0], final_classes_list[0]
-        else:
-            # Handle multiple batch items properly
-            return final_boxes_list, final_scores_list, final_classes_list
+        # Return raw outputs for CPU postprocessing
+        # Classification already has sigmoid applied in Classifier.forward()
+        return transformed_anchors, classification, anchors
 
-# =============================================================================
-# FIX 2: CORRECTED ONNX EVALUATION SCRIPT
-# =============================================================================
-
-import json
-import os
-import argparse
-import numpy as np
-import yaml
-from tqdm import tqdm
-import onnxruntime as ort
-from pycocotools.coco import COCO
-from pycocotools.cocoeval import COCOeval
-from utils.utils import preprocess, invert_affine, boolean_string
-
-class ONNXEfficientDetPostProcess:
-    def __init__(self, model_path, device='cpu'):
-        self.device = device
+class HybridEfficientDetEvaluator:
+    """
+    Uses ONNX for inference, CPU for NMS postprocessing
+    This approach typically gives the best accuracy
+    """
+    def __init__(self, model_path, score_threshold=0.05, nms_threshold=0.5, max_detections=100, device='cpu'):
+        self.score_threshold = score_threshold
+        self.nms_threshold = nms_threshold
+        self.max_detections = max_detections
+        
+        # Setup ONNX Runtime
         providers = ['CUDAExecutionProvider', 'CPUExecutionProvider'] if device == 'cuda' else ['CPUExecutionProvider']
         self.session = ort.InferenceSession(model_path, providers=providers)
         
-        inputs = self.session.get_inputs()
-        outputs = self.session.get_outputs()
+        self.input_name = self.session.get_inputs()[0].name
+        self.output_names = [output.name for output in self.session.get_outputs()]
         
-        self.input_name = inputs[0].name
-        self.output_names = [output.name for output in outputs]
-        
-        print(f"ONNX model loaded. Input: {self.input_name}, Outputs: {self.output_names}")
+        print(f"Hybrid model loaded. Outputs: {self.output_names}")
     
     def predict(self, image_tensor):
+        """Run ONNX inference then CPU NMS"""
         if hasattr(image_tensor, 'numpy'):
             image_np = image_tensor.numpy()
         else:
             image_np = image_tensor
             
+        # Get raw outputs from ONNX
         outputs = self.session.run(self.output_names, {self.input_name: image_np})
-        return outputs[0], outputs[1], outputs[2]  # boxes, scores, classes
+        transformed_anchors, classification, anchors = outputs
+        
+        # Convert back to torch tensors for NMS
+        transformed_anchors = torch.from_numpy(transformed_anchors)
+        classification = torch.from_numpy(classification)
+        
+        # Apply the same postprocessing as original PyTorch model
+        return self._cpu_postprocess(transformed_anchors, classification)
+    
+    def _cpu_postprocess(self, transformed_anchors, classification):
+        """Apply CPU-based NMS identical to original PyTorch implementation"""
+        # Get max scores and classes
+        scores = torch.max(classification, dim=2, keepdim=True)[0]
+        scores_over_thresh = (scores > self.score_threshold)[:, :, 0]
+        
+        batch_results = []
+        
+        for i in range(transformed_anchors.shape[0]):
+            if scores_over_thresh[i].sum() == 0:
+                batch_results.append({
+                    'rois': np.array([]), 
+                    'class_ids': np.array([]), 
+                    'scores': np.array([])
+                })
+                continue
 
-def evaluate_onnx_coco_fixed(img_path, set_name, image_ids, coco, model, compound_coef, params):
-    """FIXED: Proper ONNX evaluation with complete postprocessing"""
+            classification_per = classification[i, scores_over_thresh[i], ...].permute(1, 0)
+            transformed_anchors_per = transformed_anchors[i, scores_over_thresh[i], ...]
+            scores_per = scores[i, scores_over_thresh[i], ...]
+            scores_classes = classification_per.max(dim=0)
+            
+            # Use the EXACT same NMS as original PyTorch model
+            anchors_nms_idx = batched_nms(
+                transformed_anchors_per, 
+                scores_per[:, 0], 
+                scores_classes[1], 
+                iou_threshold=self.nms_threshold
+            )
+
+            if anchors_nms_idx.shape[0] != 0:
+                classes = scores_classes[1][anchors_nms_idx]
+                scores_ = scores_per[anchors_nms_idx]
+                boxes = transformed_anchors_per[anchors_nms_idx, :]
+                
+                # Limit detections
+                if len(boxes) > self.max_detections:
+                    boxes = boxes[:self.max_detections]
+                    scores_ = scores_[:self.max_detections]
+                    classes = classes[:self.max_detections]
+                
+                batch_results.append({
+                    'rois': boxes.cpu().numpy(), 
+                    'class_ids': classes.cpu().numpy(), 
+                    'scores': scores_.cpu().numpy()
+                })
+            else:
+                batch_results.append({
+                    'rois': np.array([]), 
+                    'class_ids': np.array([]), 
+                    'scores': np.array([])
+                })
+        
+        # Return first batch result (assuming batch_size=1)
+        result = batch_results[0]
+        return result['rois'], result['scores'][:, 0], result['class_ids']
+
+def convert_to_hybrid_onnx(project_file, weights_path, output_path, compound_coef=2, score_threshold=0.05):
+    """Convert to hybrid ONNX model (inference only, NMS on CPU)"""
+    device = torch.device('cpu')
+    
+    class Params:
+        def __init__(self, project_file):
+            self.params = yaml.safe_load(open(project_file).read())
+        def __getattr__(self, item):
+            return self.params.get(item, None)
+    
+    params = Params(project_file)
+    input_sizes = [512, 640, 768, 896, 1024, 1280, 1280, 1536, 1536]
+    input_size = input_sizes[compound_coef]
+    
+    # Create backbone model
+    backbone = EfficientDetBackbone(
+        num_classes=len(params.obj_list), 
+        compound_coef=compound_coef, 
+        onnx_export=True,
+        ratios=eval(params.anchors_ratios), 
+        scales=eval(params.anchors_scales)
+    ).to(device)
+    
+    backbone.backbone_net.model.set_swish(memory_efficient=False)
+    backbone.load_state_dict(torch.load(weights_path, map_location=device))
+    
+    # Create hybrid model (no NMS in ONNX)
+    model = EfficientDetONNXOnly(backbone, score_threshold)
+    model.eval()
+    
+    dummy_input = torch.randn((1, 3, input_size, input_size), dtype=torch.float32).to(device)
+    
+    print("Converting to hybrid ONNX (inference only, NMS on CPU)...")
+    
+    torch.onnx.export(
+        model, 
+        dummy_input, 
+        output_path,
+        verbose=False,
+        input_names=['input'],
+        output_names=['boxes', 'classification', 'anchors'],
+        opset_version=11,
+        do_constant_folding=True
+    )
+    
+    print(f"Hybrid ONNX model saved to: {output_path}")
+    return True
+
+def evaluate_hybrid_onnx(img_path, set_name, image_ids, coco, model, compound_coef, params):
+    """Evaluate hybrid ONNX model with CPU NMS"""
     results = []
     input_sizes = [512, 640, 768, 896, 1024, 1280, 1280, 1536, 1536]
     
@@ -169,237 +199,225 @@ def evaluate_onnx_coco_fixed(img_path, set_name, image_ids, coco, model, compoun
         image_info = coco.loadImgs(image_id)[0]
         image_path = img_path + image_info['file_name']
 
-        # Preprocess image (same as original)
-        ori_imgs, framed_imgs, framed_metas = preprocess(
-            [image_path],  # CRITICAL FIX: Pass as list
-            max_size=input_sizes[compound_coef],
-            mean=params['mean'],
-            std=params['std']
-        )
+        try:
+            ori_imgs, framed_imgs, framed_metas = preprocess(
+                [image_path],
+                max_size=input_sizes[compound_coef],
+                mean=params['mean'],
+                std=params['std']
+            )
+        except Exception as e:
+            continue
 
-        # Prepare input for ONNX
+        # Prepare input
         x = framed_imgs[0]
         x = np.expand_dims(x, axis=0)
         x = np.transpose(x, (0, 3, 1, 2))
 
-        # Run ONNX inference
         try:
+            # Get predictions with CPU NMS
             boxes, scores, classes = model.predict(x)
             
-            # CRITICAL FIX: Handle empty predictions properly
-            if len(boxes) == 0 or len(scores) == 0:
+            if len(boxes) == 0:
                 continue
                 
-            # Convert to numpy if needed
-            if hasattr(boxes, 'cpu'):
-                boxes = boxes.cpu().numpy()
-                scores = scores.cpu().numpy() 
-                classes = classes.cpu().numpy()
-            
-            # CRITICAL FIX: Proper coordinate transformation
-            # Create predictions in the format expected by invert_affine
+        except Exception as e:
+            print(f"Inference failed for image {image_id}: {e}")
+            continue
+
+        # Apply coordinate transformation
+        try:
             preds = [{
                 'rois': boxes,
-                'scores': scores,
+                'scores': scores, 
                 'class_ids': classes
             }]
             
-            # Apply coordinate transformation back to original image space
             preds = invert_affine(framed_metas, preds)[0]
             
             final_boxes = preds['rois']
             final_scores = preds['scores']
             final_classes = preds['class_ids']
             
-            # CRITICAL FIX: Process results properly
-            for i in range(len(final_boxes)):
-                box = final_boxes[i]
-                score = float(final_scores[i])
-                class_id = int(final_classes[i])
-                
-                # Convert [x1,y1,x2,y2] to [x,y,w,h] for COCO format
-                x1, y1, x2, y2 = box
-                width = x2 - x1
-                height = y2 - y1
-                
-                # CRITICAL FIX: Validate box dimensions
-                if width <= 0 or height <= 0:
-                    continue
-                    
-                # CRITICAL FIX: Validate coordinates are within reasonable bounds
-                if x1 < -1000 or y1 < -1000 or x2 > 10000 or y2 > 10000:
-                    continue
-                    
-                image_result = {
-                    'image_id': image_id,
-                    'category_id': class_id + 1,  # COCO categories start from 1
-                    'score': score,
-                    'bbox': [float(x1), float(y1), float(width), float(height)],
-                }
-                results.append(image_result)
-                
         except Exception as e:
-            print(f"Error processing image {image_id}: {e}")
-            continue
+            final_boxes = boxes
+            final_scores = scores
+            final_classes = classes
+
+        # Process results
+        for i in range(len(final_boxes)):
+            box = final_boxes[i]
+            score = float(final_scores[i])
+            class_id = int(final_classes[i])
+            
+            if score <= 0 or score > 1:
+                continue
+                
+            x1, y1, x2, y2 = box
+            width = x2 - x1
+            height = y2 - y1
+            
+            if width <= 0 or height <= 0:
+                continue
+                
+            image_result = {
+                'image_id': image_id,
+                'category_id': class_id + 1,
+                'score': score,
+                'bbox': [float(x1), float(y1), float(width), float(height)],
+            }
+            results.append(image_result)
 
     if not len(results):
-        raise Exception("The model does not provide any valid output, check model architecture and the data input")
+        raise Exception("No valid predictions generated")
 
-    # Write output
-    filepath = f'{set_name}_bbox_results_onnx_fixed.json'
+    # Save results
+    filepath = f'{set_name}_bbox_results_hybrid.json'
     if os.path.exists(filepath):
         os.remove(filepath)
     json.dump(results, open(filepath, 'w'), indent=4)
     
+    print(f"Generated {len(results)} predictions")
     return filepath
 
 # =============================================================================
-# FIX 3: VALIDATION SCRIPT TO COMPARE PYTORCH VS ONNX OUTPUTS
+# OPTION 2: TENSORRT EFFICIENTNMS (NVIDIA GPUS ONLY)
 # =============================================================================
 
-def validate_onnx_conversion(pytorch_model, onnx_session, test_input, rtol=1e-03, atol=1e-05):
+def add_efficientnms_to_onnx(onnx_model_path, output_path, num_classes, 
+                            score_threshold=0.05, nms_threshold=0.5, max_detections=100):
     """
-    Validate ONNX conversion by comparing intermediate outputs
+    Add TensorRT EfficientNMS plugin to ONNX model
+    This requires NVIDIA GPU and TensorRT
     """
-    print("Validating ONNX conversion...")
-    
-    # Get PyTorch outputs
-    pytorch_model.eval()
-    with torch.no_grad():
-        if hasattr(test_input, 'cuda'):
-            test_input = test_input.cpu()
-        
-        # Get features, regression, classification, anchors from original model
-        features, regression, classification, anchors = pytorch_model.backbone(test_input)
-        
-        # Get final outputs from original postprocessing
-        from efficientdet.utils import BBoxTransform, ClipBoxes
-        regressBoxes = BBoxTransform()
-        clipBoxes = ClipBoxes()
-        
-        transformed_anchors = regressBoxes(anchors, regression)
-        transformed_anchors = clipBoxes(transformed_anchors, test_input)
-        
-        # Get classification scores (with sigmoid)
-        classification_scores = torch.sigmoid(classification)
-        max_scores, max_classes = torch.max(classification_scores, dim=2)
-        
-    # Get ONNX outputs
-    if hasattr(test_input, 'numpy'):
-        onnx_input = test_input.numpy()
-    else:
-        onnx_input = test_input
-    
-    onnx_outputs = onnx_session.run(None, {'input': onnx_input})
-    onnx_boxes, onnx_scores, onnx_classes = onnx_outputs
-    
-    print(f"PyTorch classification scores range: {classification_scores.min().item():.6f} to {classification_scores.max().item():.6f}")
-    print(f"ONNX scores range: {float(onnx_scores.min()):.6f} to {float(onnx_scores.max()):.6f}")
-    
-    print(f"PyTorch boxes shape: {transformed_anchors.shape}")
-    print(f"ONNX boxes shape: {onnx_boxes.shape}")
-    
-    # Check for significant differences
-    score_diff = abs(float(classification_scores.max()) - float(onnx_scores.max()))
-    if score_diff > 0.1:
-        print(f"WARNING: Large score difference detected: {score_diff:.6f}")
-    else:
-        print(f"Score difference within expected range: {score_diff:.6f}")
-    
-    return True
-
-# =============================================================================
-# FIX 4: UPDATED CONVERSION SCRIPT WITH ALL FIXES
-# =============================================================================
-
-def convert_to_onnx_fixed(project_file, weights_path, output_path, compound_coef=2, 
-                         score_threshold=0.05, nms_threshold=0.5, max_detections=100):
-    """
-    FIXED conversion script with all improvements
-    """
-    device = torch.device('cpu')
-    params = Params(project_file)
-    
-    input_sizes = [512, 640, 768, 896, 1024, 1280, 1280, 1536, 1536]
-    input_size = input_sizes[compound_coef]
-    
-    print(f"Loading model with {len(params.obj_list)} classes, compound_coef={compound_coef}")
-    
-    # Create backbone model
-    backbone = EfficientDetBackbone(
-        num_classes=len(params.obj_list), 
-        compound_coef=compound_coef, 
-        onnx_export=True,  # IMPORTANT: Keep this for proper export
-        ratios=eval(params.anchors_ratios), 
-        scales=eval(params.anchors_scales)
-    ).to(device)
-    
-    # CRITICAL: Set swish to non-memory efficient for ONNX export
-    backbone.backbone_net.model.set_swish(memory_efficient=False)
-    
-    # Load weights
-    print(f"Loading weights from: {weights_path}")
-    backbone.load_state_dict(torch.load(weights_path, map_location=device))
-    
-    # Create model with IMPROVED postprocessing
-    model = EfficientDetWithPostProcess(backbone, score_threshold, nms_threshold, max_detections)
-    model.eval()
-    
-    # Create dummy input
-    dummy_input = torch.randn((1, 3, input_size, input_size), dtype=torch.float32).to(device)
-    
-    print(f"Converting to ONNX with improved postprocessing (score_thresh={score_threshold})")
-    
-    # CRITICAL: Use proper export settings
-    torch.onnx.export(
-        model, 
-        dummy_input, 
-        output_path,
-        verbose=False,  # Set to True for debugging
-        input_names=['input'],
-        output_names=['boxes', 'scores', 'classes'],
-        opset_version=11,  # Stable opset version
-        do_constant_folding=True,
-        dynamic_axes={
-            'input': {0: 'batch_size'},
-            'boxes': {0: 'num_detections'},
-            'scores': {0: 'num_detections'},
-            'classes': {0: 'num_detections'}
-        }
-    )
-    
-    # VALIDATION: Test the converted model
     try:
-        import onnxruntime as ort
-        session = ort.InferenceSession(output_path)
-        validate_onnx_conversion(model, session, dummy_input)
-        print("✓ ONNX conversion validation passed")
+        import onnx
+        import onnx_graphsurgeon as gs
+        
+        # Load the ONNX model
+        graph = gs.import_onnx(onnx.load(onnx_model_path))
+        
+        # Find the output nodes
+        boxes_output = None
+        scores_output = None
+        
+        for node in graph.nodes:
+            if 'boxes' in node.name.lower():
+                boxes_output = node.outputs[0]
+            elif 'scores' in node.name.lower() or 'classification' in node.name.lower():
+                scores_output = node.outputs[0]
+        
+        if boxes_output is None or scores_output is None:
+            raise ValueError("Could not find boxes and scores outputs in ONNX model")
+        
+        # Create EfficientNMS node
+        efficientnms_node = gs.Node(
+            op="EfficientNMS_TRT",
+            name="EfficientNMS",
+            attrs={
+                "background_class": -1,
+                "box_coding": 0,
+                "iou_threshold": nms_threshold,
+                "max_output_boxes": max_detections,
+                "plugin_version": "1",
+                "score_activation": False,
+                "score_threshold": score_threshold,
+            }
+        )
+        
+        # Create new outputs
+        num_detections = gs.Variable("num_detections", dtype=np.int32, shape=[1, 1])
+        nms_boxes = gs.Variable("detection_boxes", dtype=np.float32, shape=[1, max_detections, 4])
+        nms_scores = gs.Variable("detection_scores", dtype=np.float32, shape=[1, max_detections])
+        nms_classes = gs.Variable("detection_classes", dtype=np.int32, shape=[1, max_detections])
+        
+        efficientnms_node.inputs = [boxes_output, scores_output]
+        efficientnms_node.outputs = [num_detections, nms_boxes, nms_scores, nms_classes]
+        
+        # Add the node to the graph
+        graph.nodes.append(efficientnms_node)
+        
+        # Set graph outputs
+        graph.outputs = [num_detections, nms_boxes, nms_scores, nms_classes]
+        
+        # Clean up and save
+        graph.cleanup()
+        onnx.save(gs.export_onnx(graph), output_path)
+        
+        print(f"EfficientNMS model saved to: {output_path}")
+        return True
+        
+    except ImportError:
+        print("❌ TensorRT or onnx-graphsurgeon not available")
+        print("Install with: pip install onnx-graphsurgeon")
+        return False
     except Exception as e:
-        print(f"WARNING: ONNX validation failed: {e}")
-    
-    print(f"ONNX model with improved postprocessing saved to: {output_path}")
-
-class Params:
-    def __init__(self, project_file):
-        self.params = yaml.safe_load(open(project_file).read())
-    def __getattr__(self, item):
-        return self.params.get(item, None)
+        print(f"❌ EfficientNMS conversion failed: {e}")
+        return False
 
 # =============================================================================
-# USAGE EXAMPLE
+# USAGE EXAMPLES
 # =============================================================================
 
-if __name__ == '__main__':
-    parser = argparse.ArgumentParser('Fixed EfficientDet to ONNX conversion')
+def main_hybrid_approach():
+    """Example usage of hybrid approach (RECOMMENDED)"""
+    parser = argparse.ArgumentParser('Hybrid EfficientDet ONNX with CPU NMS')
     parser.add_argument('-p', '--project', type=str, default='projects/abhil.yml')
     parser.add_argument('-c', '--compound_coef', type=int, default=2)
     parser.add_argument('-w', '--weights', type=str, required=True)
-    parser.add_argument('-o', '--output', type=str, default='efficientdet_fixed.onnx')
+    parser.add_argument('-o', '--output', type=str, default='efficientdet_hybrid.onnx')
     parser.add_argument('--score_threshold', type=float, default=0.05)
     parser.add_argument('--nms_threshold', type=float, default=0.5)
     parser.add_argument('--max_detections', type=int, default=100)
+    parser.add_argument('--evaluate', action='store_true', help='Run evaluation after conversion')
     
     args = parser.parse_args()
     
-    convert_to_onnx_fixed(args.project, args.weights, args.output, args.compound_coef, 
-                         args.score_threshold, args.nms_threshold, args.max_detections)
+    # Convert to hybrid ONNX
+    success = convert_to_hybrid_onnx(
+        args.project, args.weights, args.output, args.compound_coef, args.score_threshold
+    )
+    
+    if success and args.evaluate:
+        # Load project parameters
+        params = yaml.safe_load(open(args.project).read())
+        
+        # Setup evaluation
+        SET_NAME = params['val_set']
+        VAL_GT = f'datasets/{params["project_name"]}/annotations/instances_{SET_NAME}.json'
+        VAL_IMGS = f'datasets/{params["project_name"]}/{SET_NAME}/'
+        
+        coco_gt = COCO(VAL_GT)
+        image_ids = coco_gt.getImgIds()[:1000]  # Limit for testing
+        
+        # Create hybrid evaluator
+        model = HybridEfficientDetEvaluator(
+            args.output, args.score_threshold, args.nms_threshold, args.max_detections
+        )
+        
+        # Run evaluation
+        results_file = evaluate_hybrid_onnx(
+            VAL_IMGS, SET_NAME, image_ids, coco_gt, model, args.compound_coef, params
+        )
+        
+        # Evaluate with COCO metrics
+        coco_pred = coco_gt.loadRes(results_file)
+        coco_eval = COCOeval(coco_gt, coco_pred, 'bbox')
+        coco_eval.params.imgIds = image_ids
+        coco_eval.evaluate()
+        coco_eval.accumulate()
+        coco_eval.summarize()
+
+if __name__ == '__main__':
+    import argparse
+    import sys
+    
+    if len(sys.argv) > 1 and sys.argv[1] == 'hybrid':
+        main_hybrid_approach()
+    else:
+        print("Available approaches:")
+        print("1. python script.py hybrid - Use hybrid approach (ONNX + CPU NMS)")
+        print("2. Use the proper ONNX NMS from the previous artifact")
+        print("3. Use TensorRT EfficientNMS (GPU only)")
+        print()
+        print("RECOMMENDATION: Use hybrid approach for best accuracy")
