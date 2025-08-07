@@ -1,483 +1,198 @@
-# ONNX EfficientDet Evaluation Script - Works with Successfully Converted Model
-# File: evaluate_onnx_model.py
+# Quick ONNX Model Test Script - Test your converted model on a single image
+# File: test_onnx_single_image.py
 
-import json
-import os
-import argparse
+import torch
 import numpy as np
 import yaml
-from tqdm import tqdm
+import argparse
+import os
 import onnxruntime as ort
+import cv2
 import time
 
-from pycocotools.coco import COCO
-from pycocotools.cocoeval import COCOeval
+from utils.utils import preprocess
 
-from utils.utils import preprocess, invert_affine, boolean_string
+class Params:
+    def __init__(self, project_file):
+        self.params = yaml.safe_load(open(project_file).read())
+    def __getattr__(self, item):
+        return self.params.get(item, None)
 
-def parse_args():
-    ap = argparse.ArgumentParser()
-    ap.add_argument('-p', '--project', type=str, default='coco', help='Project file that contains parameters')
-    ap.add_argument('-c', '--compound_coef', type=int, default=0, help='Coefficients of efficientdet')
-    ap.add_argument('-w', '--weights', type=str, required=True, help='/path/to/onnx/model.onnx')
-    ap.add_argument('--device', type=str, default='cpu', choices=['cpu', 'cuda'], help='Device for ONNX runtime')
-    ap.add_argument('--override', type=boolean_string, default=True, help='Override previous bbox results file if exists')
-    ap.add_argument('--max_images', type=int, default=100000, help='Maximum number of images to evaluate')
-    ap.add_argument('--score_threshold', type=float, default=0.001, help='Score threshold for filtering detections')
-    ap.add_argument('--confidence_threshold', type=float, default=0.05, help='Final confidence threshold for evaluation')
-    ap.add_argument('--batch_size', type=int, default=1, help='Batch size for inference')
-    ap.add_argument('--save_results', type=boolean_string, default=True, help='Save detailed results for debugging')
-    return ap.parse_args()
-
-class ONNXEfficientDetEvaluator:
-    def __init__(self, model_path, device='cpu', score_threshold=0.001):
-        self.device = device
-        self.score_threshold = score_threshold
-        
-        # Set up ONNX Runtime session with optimizations
-        providers = self._get_providers()
-        
-        # Create session with optimizations
-        session_options = ort.SessionOptions()
-        session_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-        
-        self.session = ort.InferenceSession(
-            model_path, 
-            sess_options=session_options,
-            providers=providers
-        )
-        
-        # Get input/output info
-        self.input_name = self.session.get_inputs()[0].name
-        self.output_names = [output.name for output in self.session.get_outputs()]
-        
-        print(f"ONNX model loaded successfully")
-        print(f"  Input: {self.input_name}")
-        print(f"  Outputs: {self.output_names}")
-        print(f"  Providers: {self.session.get_providers()}")
-        
-        # Get model info
-        input_shape = self.session.get_inputs()[0].shape
-        print(f"  Input shape: {input_shape}")
-        
-        # Warm up the model
-        self._warmup()
+def test_single_image(onnx_path, image_path, project_file, compound_coef=2, score_threshold=0.001):
+    """Test ONNX model on a single image"""
     
-    def _get_providers(self):
-        """Get available ONNX Runtime providers"""
-        if self.device == 'cuda':
-            providers = []
-            # Try CUDA providers
-            available_providers = ort.get_available_providers()
-            if 'CUDAExecutionProvider' in available_providers:
-                providers.append('CUDAExecutionProvider')
-            if 'CPUExecutionProvider' in available_providers:
-                providers.append('CPUExecutionProvider')
-            
-            if not providers:
-                print("⚠ CUDA requested but not available, falling back to CPU")
-                providers = ['CPUExecutionProvider']
-        else:
-            providers = ['CPUExecutionProvider']
-        
-        return providers
+    print(f"=== Testing ONNX Model on Single Image ===")
+    print(f"Model: {onnx_path}")
+    print(f"Image: {image_path}")
+    print(f"Score threshold: {score_threshold}")
     
-    def _warmup(self):
-        """Warm up the model for consistent timing"""
-        print("Warming up model...")
-        dummy_input = np.random.randn(1, 3, 768, 768).astype(np.float32)
-        
-        # Run a few warm-up iterations
-        for _ in range(3):
-            _ = self.session.run(None, {self.input_name: dummy_input})
-        
-        print("✓ Model warmed up")
-    
-    def predict(self, image_tensor):
-        """Run inference on preprocessed image tensor"""
-        if hasattr(image_tensor, 'numpy'):
-            image_np = image_tensor.numpy()
-        else:
-            image_np = image_tensor
-        
-        # Ensure correct data type
-        if image_np.dtype != np.float32:
-            image_np = image_np.astype(np.float32)
-        
-        # Run inference
-        start_time = time.time()
-        outputs = self.session.run(None, {self.input_name: image_np})
-        inference_time = time.time() - start_time
-        
-        boxes, scores, classes = outputs
-        
-        # Filter by score threshold
-        valid_mask = scores > self.score_threshold
-        
-        # Apply mask to get valid detections
-        filtered_boxes = []
-        filtered_scores = []
-        filtered_classes = []
-        
-        for i in range(boxes.shape[0]):  # For each image in batch
-            img_mask = valid_mask[i]
-            if img_mask.any():
-                filtered_boxes.append(boxes[i][img_mask])
-                filtered_scores.append(scores[i][img_mask])
-                filtered_classes.append(classes[i][img_mask])
-            else:
-                filtered_boxes.append(np.empty((0, 4)))
-                filtered_scores.append(np.empty((0,)))
-                filtered_classes.append(np.empty((0,), dtype=np.int64))
-        
-        return filtered_boxes, filtered_scores, filtered_classes, inference_time
-
-def evaluate_onnx_model(img_path, set_name, image_ids, coco, model, compound_coef, params, args):
-    """Evaluate ONNX model on COCO dataset"""
-    results = []
+    # Load parameters
+    params = Params(project_file)
     input_sizes = [512, 640, 768, 896, 1024, 1280, 1280, 1536, 1536]
-    inference_times = []
-    detection_stats = {'total_images': 0, 'images_with_detections': 0, 'total_detections': 0}
-    
-    print(f"Starting evaluation with confidence threshold: {args.confidence_threshold}")
-    
-    for image_id in tqdm(image_ids, desc="Evaluating"):
-        detection_stats['total_images'] += 1
-        
-        image_info = coco.loadImgs(image_id)[0]
-        image_path = img_path + image_info['file_name']
-        
-        try:
-            # Preprocess image (same as PyTorch model)
-            ori_imgs, framed_imgs, framed_metas = preprocess(
-                [image_path],  # preprocess expects list
-                max_size=input_sizes[compound_coef],
-                mean=params['mean'],
-                std=params['std']
-            )
-            
-            # Prepare input for ONNX
-            x = framed_imgs[0]
-            x = np.expand_dims(x, axis=0)  # Add batch dimension
-            x = np.transpose(x, (0, 3, 1, 2))  # Convert to NCHW format
-            
-            # Run ONNX inference
-            batch_boxes, batch_scores, batch_classes, inf_time = model.predict(x)
-            inference_times.append(inf_time)
-            
-            # Process first (and only) image in batch
-            boxes = batch_boxes[0]
-            scores = batch_scores[0]
-            classes = batch_classes[0]
-            
-            # Apply final confidence threshold for evaluation
-            conf_mask = scores >= args.confidence_threshold
-            if not conf_mask.any():
-                continue
-            
-            final_boxes = boxes[conf_mask]
-            final_scores = scores[conf_mask]
-            final_classes = classes[conf_mask]
-            
-            detection_stats['images_with_detections'] += 1
-            detection_stats['total_detections'] += len(final_boxes)
-            
-            # Apply coordinate transformation back to original image space
-            try:
-                # Create predictions dict in expected format for invert_affine
-                preds = [{
-                    'rois': final_boxes,
-                    'scores': final_scores,
-                    'class_ids': final_classes.astype(np.int32)
-                }]
-                
-                # Transform coordinates back to original image space
-                preds = invert_affine(framed_metas, preds)[0]
-                
-                transformed_boxes = preds['rois']
-                transformed_scores = preds['scores']
-                transformed_classes = preds['class_ids']
-                
-            except Exception as e:
-                print(f"⚠ Coordinate transformation failed for image {image_id}: {e}")
-                # Use original coordinates as fallback
-                transformed_boxes = final_boxes
-                transformed_scores = final_scores
-                transformed_classes = final_classes
-            
-            # Convert to COCO format and add to results
-            for i in range(len(transformed_boxes)):
-                box = transformed_boxes[i]
-                score = float(transformed_scores[i])
-                class_id = int(transformed_classes[i])
-                
-                # Validate box
-                if len(box) != 4:
-                    continue
-                
-                x1, y1, x2, y2 = box
-                width = x2 - x1
-                height = y2 - y1
-                
-                # Skip invalid boxes
-                if width <= 0 or height <= 0:
-                    continue
-                
-                # Create COCO format result
-                image_result = {
-                    'image_id': image_id,
-                    'category_id': class_id + 1,  # COCO categories start from 1
-                    'score': score,
-                    'bbox': [float(x1), float(y1), float(width), float(height)],  # COCO format: [x,y,w,h]
-                }
-                
-                results.append(image_result)
-        
-        except Exception as e:
-            print(f"❌ Error processing image {image_id}: {e}")
-            continue
-    
-    # Print statistics
-    avg_inference_time = np.mean(inference_times) * 1000  # Convert to ms
-    print(f"\n=== Evaluation Statistics ===")
-    print(f"Total images processed: {detection_stats['total_images']}")
-    print(f"Images with detections: {detection_stats['images_with_detections']}")
-    print(f"Total detections: {detection_stats['total_detections']}")
-    print(f"Average detections per image: {detection_stats['total_detections'] / max(detection_stats['images_with_detections'], 1):.1f}")
-    print(f"Average inference time: {avg_inference_time:.1f} ms")
-    print(f"FPS: {1000 / avg_inference_time:.1f}")
-    
-    if not results:
-        raise Exception("No valid detections found! Check score thresholds or model outputs.")
-    
-    # Save results
-    filepath = f'{set_name}_bbox_results_onnx_final.json'
-    if os.path.exists(filepath):
-        os.remove(filepath)
-    
-    with open(filepath, 'w') as f:
-        json.dump(results, f, indent=2)
-    
-    print(f"✓ Results saved to: {filepath}")
-    
-    # Save detailed statistics if requested
-    if args.save_results:
-        stats_file = f'{set_name}_evaluation_stats.json'
-        stats = {
-            'evaluation_parameters': {
-                'score_threshold': args.score_threshold,
-                'confidence_threshold': args.confidence_threshold,
-                'compound_coef': compound_coef,
-                'model_path': args.weights
-            },
-            'statistics': detection_stats,
-            'performance': {
-                'average_inference_time_ms': float(avg_inference_time),
-                'fps': float(1000 / avg_inference_time),
-                'total_inference_time_sec': float(sum(inference_times))
-            },
-            'score_distribution': analyze_score_distribution(results)
-        }
-        
-        with open(stats_file, 'w') as f:
-            json.dump(stats, f, indent=2)
-        
-        print(f"✓ Detailed stats saved to: {stats_file}")
-    
-    return filepath
-
-def analyze_score_distribution(results):
-    """Analyze the distribution of detection scores"""
-    if not results:
-        return {}
-    
-    scores = [r['score'] for r in results]
-    
-    return {
-        'min_score': float(min(scores)),
-        'max_score': float(max(scores)),
-        'mean_score': float(np.mean(scores)),
-        'median_score': float(np.median(scores)),
-        'std_score': float(np.std(scores)),
-        'percentiles': {
-            '25': float(np.percentile(scores, 25)),
-            '50': float(np.percentile(scores, 50)),
-            '75': float(np.percentile(scores, 75)),
-            '90': float(np.percentile(scores, 90)),
-            '95': float(np.percentile(scores, 95)),
-            '99': float(np.percentile(scores, 99))
-        }
-    }
-
-def evaluate_coco_metrics(coco_gt, image_ids, pred_json_path):
-    """Evaluate predictions using COCO metrics"""
-    print(f"\n=== COCO Evaluation ===")
-    
-    try:
-        coco_pred = coco_gt.loadRes(pred_json_path)
-        
-        # BBox evaluation
-        print('Running bbox evaluation...')
-        coco_eval = COCOeval(coco_gt, coco_pred, 'bbox')
-        coco_eval.params.imgIds = image_ids
-        coco_eval.evaluate()
-        coco_eval.accumulate()
-        coco_eval.summarize()
-        
-        # Extract key metrics
-        metrics = {
-            'mAP_0.5:0.95': float(coco_eval.stats[0]),
-            'mAP_0.5': float(coco_eval.stats[1]),
-            'mAP_0.75': float(coco_eval.stats[2]),
-            'mAP_small': float(coco_eval.stats[3]),
-            'mAP_medium': float(coco_eval.stats[4]),
-            'mAP_large': float(coco_eval.stats[5]),
-            'mAR_1': float(coco_eval.stats[6]),
-            'mAR_10': float(coco_eval.stats[7]),
-            'mAR_100': float(coco_eval.stats[8]),
-            'mAR_small': float(coco_eval.stats[9]),
-            'mAR_medium': float(coco_eval.stats[10]),
-            'mAR_large': float(coco_eval.stats[11])
-        }
-        
-        return metrics
-        
-    except Exception as e:
-        print(f"❌ COCO evaluation failed: {e}")
-        return {}
-
-def compare_with_pytorch_results(pytorch_results_path, onnx_results_path):
-    """Compare ONNX results with PyTorch baseline"""
-    if not os.path.exists(pytorch_results_path):
-        print(f"⚠ PyTorch results not found at {pytorch_results_path}")
-        return
-    
-    print(f"\n=== Comparison with PyTorch Baseline ===")
-    
-    try:
-        with open(pytorch_results_path, 'r') as f:
-            pytorch_results = json.load(f)
-        
-        with open(onnx_results_path, 'r') as f:
-            onnx_results = json.load(f)
-        
-        print(f"PyTorch detections: {len(pytorch_results)}")
-        print(f"ONNX detections: {len(onnx_results)}")
-        print(f"Detection count difference: {len(onnx_results) - len(pytorch_results)}")
-        
-        # Analyze score differences
-        if pytorch_results and onnx_results:
-            pt_scores = [r['score'] for r in pytorch_results]
-            onnx_scores = [r['score'] for r in onnx_results]
-            
-            print(f"Score statistics:")
-            print(f"  PyTorch - mean: {np.mean(pt_scores):.4f}, std: {np.std(pt_scores):.4f}")
-            print(f"  ONNX    - mean: {np.mean(onnx_scores):.4f}, std: {np.std(onnx_scores):.4f}")
-        
-        # Per-image comparison
-        pt_by_image = {}
-        for det in pytorch_results:
-            img_id = det['image_id']
-            if img_id not in pt_by_image:
-                pt_by_image[img_id] = 0
-            pt_by_image[img_id] += 1
-        
-        onnx_by_image = {}
-        for det in onnx_results:
-            img_id = det['image_id']
-            if img_id not in onnx_by_image:
-                onnx_by_image[img_id] = 0
-            onnx_by_image[img_id] += 1
-        
-        # Find images with large differences
-        large_diffs = []
-        all_images = set(pt_by_image.keys()) | set(onnx_by_image.keys())
-        
-        for img_id in all_images:
-            pt_count = pt_by_image.get(img_id, 0)
-            onnx_count = onnx_by_image.get(img_id, 0)
-            diff = abs(pt_count - onnx_count)
-            
-            if diff > 5:  # Significant difference
-                large_diffs.append((img_id, pt_count, onnx_count, diff))
-        
-        if large_diffs:
-            print(f"Images with large detection differences (>5): {len(large_diffs)}")
-            # Show top 5 differences
-            large_diffs.sort(key=lambda x: x[3], reverse=True)
-            for img_id, pt_count, onnx_count, diff in large_diffs[:5]:
-                print(f"  Image {img_id}: PyTorch={pt_count}, ONNX={onnx_count}, diff={diff}")
-        else:
-            print("✓ Detection counts are well-matched between PyTorch and ONNX")
-            
-    except Exception as e:
-        print(f"❌ Comparison failed: {e}")
-
-def main():
-    args = parse_args()
-    
-    # Load project parameters
-    params = yaml.safe_load(open(f'projects/{args.project}.yml'))
-    
-    print(f"=== ONNX EfficientDet Evaluation ===")
-    print(f"Project: {args.project}")
-    print(f"Model: {args.weights}")
-    print(f"Compound coef: {args.compound_coef}")
-    print(f"Score threshold: {args.score_threshold}")
-    print(f"Confidence threshold: {args.confidence_threshold}")
-    print(f"Max images: {args.max_images}")
-    
-    # Dataset paths
-    SET_NAME = params['val_set']
-    VAL_GT = f'datasets/{params["project_name"]}/annotations/instances_{SET_NAME}.json'
-    VAL_IMGS = f'datasets/{params["project_name"]}/{SET_NAME}/'
-    
-    # Verify dataset exists
-    if not os.path.exists(VAL_GT):
-        print(f"❌ Ground truth file not found: {VAL_GT}")
-        exit(1)
-    
-    if not os.path.exists(VAL_IMGS):
-        print(f"❌ Images directory not found: {VAL_IMGS}")
-        exit(1)
-    
-    # Load COCO dataset
-    print("Loading COCO dataset...")
-    coco_gt = COCO(VAL_GT)
-    image_ids = coco_gt.getImgIds()[:args.max_images]
-    print(f"✓ Loaded {len(image_ids)} images for evaluation")
+    input_size = input_sizes[compound_coef]
     
     # Load ONNX model
     print("Loading ONNX model...")
-    model = ONNXEfficientDetEvaluator(args.weights, args.device, args.score_threshold)
+    try:
+        session = ort.InferenceSession(onnx_path, providers=['CPUExecutionProvider'])
+        input_name = session.get_inputs()[0].name
+        output_names = [out.name for out in session.get_outputs()]
+        print(f"✓ Model loaded successfully")
+        print(f"  Input: {input_name}")
+        print(f"  Outputs: {output_names}")
+    except Exception as e:
+        print(f"❌ Failed to load ONNX model: {e}")
+        return False
     
-    # Run evaluation
-    results_file = f'{SET_NAME}_bbox_results_onnx_final.json'
-    if args.override or not os.path.exists(results_file):
-        print("Running evaluation...")
-        results_file = evaluate_onnx_model(
-            VAL_IMGS, SET_NAME, image_ids, coco_gt, model, 
-            args.compound_coef, params, args
+    # Load and preprocess image
+    print("Preprocessing image...")
+    try:
+        if not os.path.exists(image_path):
+            print(f"❌ Image not found: {image_path}")
+            return False
+        
+        # Read original image for display
+        original_img = cv2.imread(image_path)
+        if original_img is None:
+            print(f"❌ Could not read image: {image_path}")
+            return False
+        
+        print(f"  Original image shape: {original_img.shape}")
+        
+        # Preprocess using same method as evaluation
+        ori_imgs, framed_imgs, framed_metas = preprocess(
+            [image_path],
+            max_size=input_size,
+            mean=params.mean,
+            std=params.std
         )
+        
+        # Prepare input tensor
+        x = framed_imgs[0]
+        x = np.expand_dims(x, axis=0)  # Add batch dimension
+        x = np.transpose(x, (0, 3, 1, 2))  # Convert to NCHW
+        
+        print(f"  Preprocessed shape: {x.shape}")
+        print(f"  Input range: [{x.min():.3f}, {x.max():.3f}]")
+        
+    except Exception as e:
+        print(f"❌ Preprocessing failed: {e}")
+        return False
+    
+    # Run inference
+    print("Running inference...")
+    try:
+        start_time = time.time()
+        outputs = session.run(None, {input_name: x})
+        inference_time = time.time() - start_time
+        
+        boxes, scores, classes = outputs
+        print(f"✓ Inference successful in {inference_time*1000:.1f} ms")
+        print(f"  Output shapes: boxes={boxes.shape}, scores={scores.shape}, classes={classes.shape}")
+        
+    except Exception as e:
+        print(f"❌ Inference failed: {e}")
+        return False
+    
+    # Analyze outputs
+    print("Analyzing outputs...")
+    
+    # Get detections for first (and only) image
+    img_boxes = boxes[0]
+    img_scores = scores[0]
+    img_classes = classes[0]
+    
+    print(f"  Raw output ranges:")
+    print(f"    Boxes: [{img_boxes.min():.3f}, {img_boxes.max():.3f}]")
+    print(f"    Scores: [{img_scores.min():.3f}, {img_scores.max():.3f}]")
+    print(f"    Classes: [{img_classes.min():.0f}, {img_classes.max():.0f}]")
+    
+    # Filter by score threshold
+    valid_mask = img_scores > score_threshold
+    valid_count = np.sum(valid_mask)
+    
+    print(f"  Valid detections (score > {score_threshold}): {valid_count}")
+    
+    if valid_count == 0:
+        print("⚠ No detections above threshold. Try lowering score_threshold.")
+        # Show score distribution
+        sorted_scores = np.sort(img_scores[img_scores > 0])[::-1]  # Descending order
+        if len(sorted_scores) > 0:
+            print(f"  Top scores: {sorted_scores[:10]}")
+        return True
+    
+    # Get valid detections
+    valid_boxes = img_boxes[valid_mask]
+    valid_scores = img_scores[valid_mask]
+    valid_classes = img_classes[valid_mask]
+    
+    # Sort by score
+    sort_indices = np.argsort(valid_scores)[::-1]
+    valid_boxes = valid_boxes[sort_indices]
+    valid_scores = valid_scores[sort_indices]
+    valid_classes = valid_classes[sort_indices]
+    
+    print(f"  Top detections:")
+    for i in range(min(5, len(valid_scores))):
+        score = valid_scores[i]
+        class_id = int(valid_classes[i])
+        box = valid_boxes[i]
+        print(f"    Detection {i+1}: class={class_id}, score={score:.4f}, box=[{box[0]:.1f}, {box[1]:.1f}, {box[2]:.1f}, {box[3]:.1f}]")
+    
+    # Test different confidence thresholds
+    print(f"  Detection counts at different confidence thresholds:")
+    for conf_thresh in [0.001, 0.01, 0.05, 0.1, 0.3, 0.5]:
+        count = np.sum(valid_scores >= conf_thresh)
+        print(f"    >= {conf_thresh}: {count} detections")
+    
+    print(f"✅ Single image test completed successfully!")
+    print(f"💡 Suggested confidence threshold for evaluation: {suggest_confidence_threshold(valid_scores):.3f}")
+    
+    return True
+
+def suggest_confidence_threshold(scores):
+    """Suggest a good confidence threshold based on score distribution"""
+    if len(scores) == 0:
+        return 0.05
+    
+    # Use 75th percentile as a reasonable threshold
+    return float(np.percentile(scores, 75))
+
+def main():
+    parser = argparse.ArgumentParser('Test ONNX Model on Single Image')
+    parser.add_argument('-m', '--model', type=str, required=True, help='Path to ONNX model')
+    parser.add_argument('-i', '--image', type=str, required=True, help='Path to test image')
+    parser.add_argument('-p', '--project', type=str, default='projects/abhil.yml', help='Project file')
+    parser.add_argument('-c', '--compound_coef', type=int, default=2, help='Compound coefficient')
+    parser.add_argument('--score_threshold', type=float, default=0.001, help='Score threshold')
+    
+    args = parser.parse_args()
+    
+    # Validate inputs
+    if not os.path.exists(args.model):
+        print(f"❌ ONNX model not found: {args.model}")
+        exit(1)
+    
+    if not os.path.exists(args.image):
+        print(f"❌ Test image not found: {args.image}")
+        exit(1)
+    
+    if not os.path.exists(args.project):
+        print(f"❌ Project file not found: {args.project}")
+        exit(1)
+    
+    # Run test
+    success = test_single_image(
+        args.model, args.image, args.project, 
+        args.compound_coef, args.score_threshold
+    )
+    
+    if success:
+        print(f"\n✅ Your ONNX model is working correctly!")
+        print(f"🚀 Ready for full evaluation with:")
+        print(f"   python evaluate_onnx_model.py -p abhil -c {args.compound_coef} -w {args.model}")
     else:
-        print(f"Using existing results: {results_file}")
-    
-    # Compare with PyTorch results if available
-    pytorch_results_file = f'{SET_NAME}_bbox_results.json'
-    compare_with_pytorch_results(pytorch_results_file, results_file)
-    
-    # Run COCO evaluation
-    metrics = evaluate_coco_metrics(coco_gt, image_ids, results_file)
-    
-    # Print final summary
-    print(f"\n=== FINAL RESULTS ===")
-    if metrics:
-        print(f"mAP@0.5:0.95: {metrics['mAP_0.5:0.95']:.4f}")
-        print(f"mAP@0.5:     {metrics['mAP_0.5']:.4f}")
-        print(f"mAP@0.75:    {metrics['mAP_0.75']:.4f}")
-    
-    print(f"✅ Evaluation completed successfully")
-    print(f"Results saved to: {results_file}")
+        print(f"\n❌ Issues detected with your ONNX model")
 
 if __name__ == '__main__':
     main()
