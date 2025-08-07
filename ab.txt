@@ -1,169 +1,10 @@
-# Fixed ONNX Conversion Script - Addressing Specific Warnings and Errors
-# File: convert_onnx_error_fixes.py
+# Debug Script for ONNX Conversion Issues
+# File: debug_conversion.py
 
 import torch
-import torch.nn as nn
 import yaml
-import argparse
 import os
-import numpy as np
-import warnings
 from backbone import EfficientDetBackbone
-from efficientdet.utils import BBoxTransform, ClipBoxes
-import torchvision
-
-# Suppress specific warnings during conversion
-warnings.filterwarnings("ignore", message=".*TracerWarning.*")
-warnings.filterwarnings("ignore", message=".*Converting a tensor to a Python.*")
-
-# CRITICAL FIX 1: Replace problematic operations before model creation
-def replace_onnx_incompatible_ops():
-    """Replace operations that cause ONNX conversion issues"""
-    
-    # Fix batched_nms for ONNX compatibility
-    try:
-        from torchvision.ops.boxes import _batched_nms_coordinate_trick
-        torchvision.ops.boxes.batched_nms = _batched_nms_coordinate_trick
-        print("✓ Replaced batched_nms with ONNX-compatible version")
-    except ImportError:
-        print("⚠ Using fallback batched_nms implementation")
-        def onnx_batched_nms(boxes, scores, idxs, iou_threshold):
-            if boxes.numel() == 0:
-                return torch.empty((0,), dtype=torch.int64, device=boxes.device)
-            max_coordinate = boxes.max()
-            offsets = idxs.to(boxes) * (max_coordinate + 1)
-            boxes_for_nms = boxes + offsets[:, None]
-            keep = torchvision.ops.nms(boxes_for_nms, scores, iou_threshold)
-            return keep
-        torchvision.ops.boxes.batched_nms = onnx_batched_nms
-
-class ONNXCompatibleClipBoxes(nn.Module):
-    """ONNX-compatible version of ClipBoxes that avoids dynamic operations"""
-    
-    def __init__(self):
-        super(ONNXCompatibleClipBoxes, self).__init__()
-
-    def forward(self, boxes, img):
-        # FIX: Use static values instead of dynamic shape extraction
-        # Get image dimensions from tensor shape (avoid .shape[] indexing warnings)
-        batch_size = img.size(0)
-        height = img.size(2) 
-        width = img.size(3)
-        
-        # Convert to float to avoid conversion warnings
-        height_f = float(height)
-        width_f = float(width)
-        
-        # Use torch.clamp with explicit min/max values to avoid Python conversion
-        boxes_clamped = torch.stack([
-            torch.clamp(boxes[:, :, 0], min=0.0),  # x1
-            torch.clamp(boxes[:, :, 1], min=0.0),  # y1  
-            torch.clamp(boxes[:, :, 2], max=width_f - 1.0),   # x2
-            torch.clamp(boxes[:, :, 3], max=height_f - 1.0)   # y2
-        ], dim=2)
-        
-        return boxes_clamped
-
-class ONNXCompatibleBBoxTransform(nn.Module):
-    """ONNX-compatible version of BBoxTransform"""
-    
-    def forward(self, anchors, regression):
-        # Avoid tensor-to-Python conversion warnings by using tensor operations
-        y_centers_a = (anchors[..., 0] + anchors[..., 2]) * 0.5
-        x_centers_a = (anchors[..., 1] + anchors[..., 3]) * 0.5
-        ha = anchors[..., 2] - anchors[..., 0]
-        wa = anchors[..., 3] - anchors[..., 1]
-
-        w = torch.exp(regression[..., 3]) * wa
-        h = torch.exp(regression[..., 2]) * ha
-
-        y_centers = regression[..., 0] * ha + y_centers_a
-        x_centers = regression[..., 1] * wa + x_centers_a
-
-        # Use tensor operations to avoid Python conversion warnings
-        half_w = w * 0.5
-        half_h = h * 0.5
-        
-        ymin = y_centers - half_h
-        xmin = x_centers - half_w
-        ymax = y_centers + half_h
-        xmax = x_centers + half_w
-
-        return torch.stack([xmin, ymin, xmax, ymax], dim=2)
-
-class EfficientDetONNXSafe(nn.Module):
-    """ONNX-safe EfficientDet wrapper that avoids dynamic operations"""
-    
-    def __init__(self, backbone, score_threshold=0.05, nms_threshold=0.5, max_detections=100):
-        super().__init__()
-        self.backbone = backbone
-        
-        # Use fixed constants to avoid tensor-to-Python conversion warnings
-        self.score_threshold = torch.tensor(score_threshold, dtype=torch.float32)
-        self.nms_threshold = nms_threshold
-        self.max_detections = max_detections
-        
-        # Use ONNX-compatible versions
-        self.regressBoxes = ONNXCompatibleBBoxTransform()
-        self.clipBoxes = ONNXCompatibleClipBoxes()
-    
-    def forward(self, x):
-        # Get backbone outputs
-        features, regression, classification, anchors = self.backbone(x)
-        
-        # Transform boxes using ONNX-safe operations
-        transformed_anchors = self.regressBoxes(anchors, regression)
-        transformed_anchors = self.clipBoxes(transformed_anchors, x)
-        
-        # FIX: Avoid tensor-to-Python boolean conversion in score filtering
-        # Use tensor operations throughout
-        scores = torch.max(classification, dim=2, keepdim=True)[0]
-        classes = torch.max(classification, dim=2)[1]
-        
-        # Use tensor comparison to avoid Python boolean conversion
-        score_mask = torch.gt(scores, self.score_threshold.to(scores.device))
-        
-        # Process each image in batch
-        batch_size = x.size(0)
-        
-        # Pre-allocate output tensors with fixed sizes to avoid dynamic shapes
-        output_boxes = torch.zeros((batch_size, self.max_detections, 4), 
-                                 device=x.device, dtype=torch.float32)
-        output_scores = torch.zeros((batch_size, self.max_detections), 
-                                  device=x.device, dtype=torch.float32)
-        output_classes = torch.zeros((batch_size, self.max_detections), 
-                                   device=x.device, dtype=torch.long)
-        
-        # FIX: Use scripted loops to avoid tracing warnings
-        for i in range(batch_size):
-            # Get valid detections for this image
-            img_score_mask = score_mask[i, :, 0]
-            
-            # Early exit if no detections (but still need to return tensors)
-            valid_count = torch.sum(img_score_mask)
-            if valid_count == 0:
-                continue
-                
-            valid_boxes = transformed_anchors[i][img_score_mask]
-            valid_scores = scores[i][img_score_mask, 0]
-            valid_classes = classes[i][img_score_mask]
-            
-            # Apply NMS - this is where the main filtering happens
-            if valid_boxes.size(0) > 0:
-                keep_indices = torchvision.ops.batched_nms(
-                    valid_boxes, valid_scores, valid_classes, self.nms_threshold
-                )
-                
-                # Limit to max detections
-                keep_count = min(len(keep_indices), self.max_detections)
-                if keep_count > 0:
-                    final_indices = keep_indices[:keep_count]
-                    
-                    output_boxes[i, :keep_count] = valid_boxes[final_indices]
-                    output_scores[i, :keep_count] = valid_scores[final_indices]
-                    output_classes[i, :keep_count] = valid_classes[final_indices]
-        
-        return output_boxes, output_scores, output_classes
 
 class Params:
     def __init__(self, project_file):
@@ -171,139 +12,206 @@ class Params:
     def __getattr__(self, item):
         return self.params.get(item, None)
 
-def convert_to_onnx_safe(project_file, weights_path, output_path, compound_coef=2, 
-                        score_threshold=0.05, nms_threshold=0.5, max_detections=100):
+def debug_model_structure(model, prefix=""):
+    """Debug model structure to find swish-related issues"""
+    print(f"\n=== Model Structure Debug ===")
     
-    # Apply ONNX compatibility fixes
-    replace_onnx_incompatible_ops()
+    def print_module_info(module, name="", level=0):
+        indent = "  " * level
+        module_type = type(module).__name__
+        print(f"{indent}{name}: {module_type}")
+        
+        # Check for swish-related attributes
+        if hasattr(module, 'swish'):
+            print(f"{indent}  ✓ Has swish attribute: {type(module.swish)}")
+        if hasattr(module, '_swish'):
+            print(f"{indent}  ✓ Has _swish attribute: {type(module._swish)}")
+        if hasattr(module, 'set_swish'):
+            print(f"{indent}  ✓ Has set_swish method")
+        
+        # Recursively check children (limit depth to avoid too much output)
+        if level < 3:
+            for child_name, child_module in module.named_children():
+                print_module_info(child_module, child_name, level + 1)
     
-    device = torch.device('cpu')  # Use CPU for more stable conversion
-    params = Params(project_file)
-    
-    input_sizes = [512, 640, 768, 896, 1024, 1280, 1280, 1536, 1536]
-    input_size = input_sizes[compound_coef]
-    
-    print(f"Creating model with {len(params.obj_list)} classes, compound_coef={compound_coef}")
-    
-    # Create backbone
-    backbone = EfficientDetBackbone(
-        num_classes=len(params.obj_list), 
-        compound_coef=compound_coef, 
-        onnx_export=True,  # Critical for ONNX compatibility
-        ratios=eval(params.anchors_ratios), 
-        scales=eval(params.anchors_scales)
-    ).to(device)
-    
-    # FIX: Ensure non-memory-efficient swish for ONNX
-    backbone.backbone_net.model.set_swish(memory_efficient=False)
-    
-    # Load weights
-    print(f"Loading weights from: {weights_path}")
-    backbone.load_state_dict(torch.load(weights_path, map_location=device))
-    backbone.eval()
-    
-    # Create ONNX-safe wrapper
-    model = EfficientDetONNXSafe(backbone, score_threshold, nms_threshold, max_detections)
-    model.eval()
-    
-    # Create dummy input
-    dummy_input = torch.randn((1, 3, input_size, input_size), dtype=torch.float32).to(device)
-    
-    print(f"Converting to ONNX (input_size={input_size})...")
-    
-    # FIX: Use torch.jit.script instead of trace to handle control flow better
-    try:
-        print("Attempting scripted conversion...")
-        with torch.no_grad():
-            # First do a test run to identify issues
-            test_output = model(dummy_input)
-            print(f"✓ Model test run successful, output shapes: {[t.shape for t in test_output]}")
-            
-            # Use scripting for better control flow handling
-            scripted_model = torch.jit.script(model)
-            
-    except Exception as e:
-        print(f"Scripting failed: {e}")
-        print("Falling back to tracing...")
-        with torch.no_grad():
-            scripted_model = torch.jit.trace(model, dummy_input, strict=False)
-    
-    # Export with optimized settings
-    torch.onnx.export(
-        scripted_model,
-        dummy_input,
-        output_path,
-        verbose=False,  # Reduce verbose output to minimize warnings
-        input_names=['input'],
-        output_names=['boxes', 'scores', 'classes'],
-        opset_version=11,
-        do_constant_folding=True,
-        export_params=True,
-        keep_initializers_as_inputs=False,
-        dynamic_axes={
-            'input': {0: 'batch_size'},
-            'boxes': {0: 'batch_size'},
-            'scores': {0: 'batch_size'}, 
-            'classes': {0: 'batch_size'}
-        },
-        # FIX: Additional export settings to handle warnings
-        operator_export_type=torch.onnx.OperatorExportTypes.ONNX,
-        strip_doc_string=True
-    )
-    
-    print(f"✓ ONNX model saved to: {output_path}")
-    
-    # Validate the exported model
-    validate_onnx_model(output_path, dummy_input, scripted_model)
+    print_module_info(model)
 
-def validate_onnx_model(onnx_path, test_input, pytorch_model):
-    """Validate ONNX model works correctly"""
+def test_model_inference(model, input_size=768):
+    """Test if model can run inference properly"""
+    print(f"\n=== Model Inference Test ===")
+    
     try:
-        import onnxruntime as ort
-        print("Validating ONNX model...")
+        model.eval()
+        dummy_input = torch.randn(1, 3, input_size, input_size)
         
-        # Test ONNX model
-        session = ort.InferenceSession(onnx_path, providers=['CPUExecutionProvider'])
-        onnx_input = {session.get_inputs()[0].name: test_input.numpy()}
-        onnx_outputs = session.run(None, onnx_input)
+        print(f"Input shape: {dummy_input.shape}")
         
-        # Test PyTorch model
         with torch.no_grad():
-            pytorch_outputs = pytorch_model(test_input)
+            outputs = model(dummy_input)
+            
+        print(f"✓ Inference successful!")
+        print(f"Number of outputs: {len(outputs)}")
         
-        # Compare outputs
-        print("Validation results:")
-        for i, (pt_out, onnx_out) in enumerate(zip(pytorch_outputs, onnx_outputs)):
-            diff = np.abs(pt_out.numpy() - onnx_out).max()
-            print(f"  Output {i}: max_diff = {diff:.2e}")
-            if diff < 1e-4:
-                print(f"    ✓ Good match")
-            else:
-                print(f"    ⚠ Large difference")
+        for i, output in enumerate(outputs):
+            print(f"  Output {i}: {output.shape}, dtype: {output.dtype}")
+            non_zero = torch.count_nonzero(output)
+            print(f"    Non-zero elements: {non_zero}")
+            
+        return True, outputs
         
-        print("✓ ONNX validation complete")
-        
-    except ImportError:
-        print("⚠ onnxruntime not available, skipping validation")
     except Exception as e:
-        print(f"⚠ Validation failed: {e}")
+        print(f"❌ Inference failed: {e}")
+        return False, None
 
-if __name__ == '__main__':
-    parser = argparse.ArgumentParser('Convert EfficientDet to ONNX (Error-Free)')
-    parser.add_argument('-p', '--project', type=str, default='projects/abhil.yml', help='Project file')
-    parser.add_argument('-c', '--compound_coef', type=int, default=2, help='EfficientDet compound coefficient')
-    parser.add_argument('-w', '--weights', type=str, required=True, help='Path to weights file')
-    parser.add_argument('-o', '--output', type=str, default='efficientdet_onnx_safe.onnx', help='Output ONNX file')
-    parser.add_argument('--score_threshold', type=float, default=0.05, help='Score threshold')
-    parser.add_argument('--nms_threshold', type=float, default=0.5, help='NMS threshold')
-    parser.add_argument('--max_detections', type=int, default=100, help='Max detections')
+def check_swish_implementations(model):
+    """Check and fix swish implementations"""
+    print(f"\n=== Swish Implementation Check ===")
+    
+    swish_modules = []
+    
+    def find_swish_modules(module, path=""):
+        for name, child in module.named_children():
+            child_path = f"{path}.{name}" if path else name
+            
+            # Check if this is a swish-like module
+            if 'swish' in name.lower() or 'Swish' in str(type(child)):
+                swish_modules.append((child_path, child))
+                print(f"Found swish module: {child_path} -> {type(child)}")
+            
+            find_swish_modules(child, child_path)
+    
+    find_swish_modules(model)
+    
+    print(f"Total swish modules found: {len(swish_modules)}")
+    
+    # Try to fix swish modules
+    fixed_count = 0
+    for path, module in swish_modules:
+        try:
+            if hasattr(module, 'set_swish'):
+                module.set_swish(memory_efficient=False)
+                print(f"✓ Fixed swish at {path}")
+                fixed_count += 1
+        except Exception as e:
+            print(f"⚠ Could not fix swish at {path}: {e}")
+    
+    print(f"Fixed {fixed_count} swish modules")
+    
+    return fixed_count > 0
+
+def minimal_onnx_test(model, input_size=768):
+    """Test minimal ONNX export without postprocessing"""
+    print(f"\n=== Minimal ONNX Export Test ===")
+    
+    try:
+        # Create a wrapper that only does backbone inference
+        class MinimalEfficientDet(torch.nn.Module):
+            def __init__(self, backbone):
+                super().__init__()
+                self.backbone = backbone
+                
+            def forward(self, x):
+                features, regression, classification, anchors = self.backbone(x)
+                return regression, classification  # Return raw outputs only
+        
+        minimal_model = MinimalEfficientDet(model)
+        minimal_model.eval()
+        
+        dummy_input = torch.randn(1, 3, input_size, input_size)
+        
+        # Test inference
+        with torch.no_grad():
+            outputs = minimal_model(dummy_input)
+            print(f"✓ Minimal model inference successful")
+            print(f"Outputs: {[o.shape for o in outputs]}")
+        
+        # Try ONNX export
+        output_path = "test_minimal.onnx"
+        torch.onnx.export(
+            minimal_model,
+            dummy_input,
+            output_path,
+            verbose=False,
+            input_names=['input'],
+            output_names=['regression', 'classification'],
+            opset_version=11
+        )
+        
+        file_size = os.path.getsize(output_path) / (1024 * 1024)
+        print(f"✓ Minimal ONNX export successful")
+        print(f"File size: {file_size:.1f} MB")
+        
+        # Clean up
+        if os.path.exists(output_path):
+            os.remove(output_path)
+            
+        return True
+        
+    except Exception as e:
+        print(f"❌ Minimal ONNX export failed: {e}")
+        return False
+
+def main():
+    import argparse
+    
+    parser = argparse.ArgumentParser('Debug ONNX Conversion')
+    parser.add_argument('-p', '--project', type=str, default='projects/abhil.yml')
+    parser.add_argument('-c', '--compound_coef', type=int, default=2)
+    parser.add_argument('-w', '--weights', type=str, required=True)
     
     args = parser.parse_args()
     
-    if not os.path.exists(args.weights):
-        raise FileNotFoundError(f"Weights file not found: {args.weights}")
+    print("=== EfficientDet ONNX Conversion Debug ===")
+    print(f"Project: {args.project}")
+    print(f"Compound coef: {args.compound_coef}")
+    print(f"Weights: {args.weights}")
     
-    convert_to_onnx_safe(
-        args.project, args.weights, args.output, args.compound_coef,
-        args.score_threshold, args.nms_threshold, args.max_detections
+    # Load parameters
+    params = Params(args.project)
+    print(f"Classes: {len(params.obj_list)}")
+    
+    # Create model
+    print(f"\nCreating model...")
+    model = EfficientDetBackbone(
+        num_classes=len(params.obj_list), 
+        compound_coef=args.compound_coef, 
+        onnx_export=True,
+        ratios=eval(params.anchors_ratios), 
+        scales=eval(params.anchors_scales)
     )
+    
+    # Load weights
+    print(f"Loading weights...")
+    model.load_state_dict(torch.load(args.weights, map_location='cpu'))
+    
+    # Run debug tests
+    debug_model_structure(model)
+    
+    swish_fixed = check_swish_implementations(model)
+    
+    inference_ok, outputs = test_model_inference(model)
+    
+    if inference_ok:
+        minimal_export_ok = minimal_onnx_test(model)
+    else:
+        minimal_export_ok = False
+    
+    # Summary
+    print(f"\n=== Debug Summary ===")
+    print(f"Swish modules fixed: {'✓' if swish_fixed else '❌'}")
+    print(f"Model inference: {'✓' if inference_ok else '❌'}")
+    print(f"Minimal ONNX export: {'✓' if minimal_export_ok else '❌'}")
+    
+    if inference_ok and minimal_export_ok:
+        print(f"\n✅ Model looks good for ONNX conversion!")
+        print(f"Try running the robust conversion script.")
+    else:
+        print(f"\n❌ Model has issues that need to be fixed first.")
+        
+        if not inference_ok:
+            print("  - Fix model inference issues first")
+        if not minimal_export_ok:
+            print("  - ONNX export compatibility issues detected")
+
+if __name__ == '__main__':
+    main()
