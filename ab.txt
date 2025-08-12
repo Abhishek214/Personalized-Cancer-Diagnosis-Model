@@ -1,198 +1,277 @@
-# Quick ONNX Model Test Script - Test your converted model on a single image
-# File: test_onnx_single_image.py
-
-import torch
-import numpy as np
-import yaml
-import argparse
 import os
-import onnxruntime as ort
 import cv2
-import time
+import torch
+import yaml
+import numpy as np
+import argparse
+from tqdm import tqdm
+from pycocotools.coco import COCO
 
-from utils.utils import preprocess
+from backbone import EfficientDetBackbone
+from efficientdet.utils import BBoxTransform, ClipBoxes
+from efficientdet.dataset import CocoDataset, Normalizer, Resizer
+from utils.utils import preprocess, invert_affine, postprocess, boolean_string
 
-class Params:
-    def __init__(self, project_file):
-        self.params = yaml.safe_load(open(project_file).read())
-    def __getattr__(self, item):
-        return self.params.get(item, None)
 
-def test_single_image(onnx_path, image_path, project_file, compound_coef=2, score_threshold=0.001):
-    """Test ONNX model on a single image"""
+def calculate_iou(box1, box2):
+    """
+    Calculate IoU between two boxes
+    box format: [x1, y1, x2, y2]
+    """
+    # Calculate intersection
+    x1 = max(box1[0], box2[0])
+    y1 = max(box1[1], box2[1])
+    x2 = min(box1[2], box2[2])
+    y2 = min(box1[3], box2[3])
     
-    print(f"=== Testing ONNX Model on Single Image ===")
-    print(f"Model: {onnx_path}")
-    print(f"Image: {image_path}")
-    print(f"Score threshold: {score_threshold}")
+    if x2 <= x1 or y2 <= y1:
+        return 0.0
     
-    # Load parameters
-    params = Params(project_file)
-    input_sizes = [512, 640, 768, 896, 1024, 1280, 1280, 1536, 1536]
-    input_size = input_sizes[compound_coef]
+    intersection = (x2 - x1) * (y2 - y1)
     
-    # Load ONNX model
-    print("Loading ONNX model...")
-    try:
-        session = ort.InferenceSession(onnx_path, providers=['CPUExecutionProvider'])
-        input_name = session.get_inputs()[0].name
-        output_names = [out.name for out in session.get_outputs()]
-        print(f"✓ Model loaded successfully")
-        print(f"  Input: {input_name}")
-        print(f"  Outputs: {output_names}")
-    except Exception as e:
-        print(f"❌ Failed to load ONNX model: {e}")
-        return False
+    # Calculate union
+    area1 = (box1[2] - box1[0]) * (box1[3] - box1[1])
+    area2 = (box2[2] - box2[0]) * (box2[3] - box2[1])
+    union = area1 + area2 - intersection
     
-    # Load and preprocess image
-    print("Preprocessing image...")
-    try:
-        if not os.path.exists(image_path):
-            print(f"❌ Image not found: {image_path}")
-            return False
-        
-        # Read original image for display
-        original_img = cv2.imread(image_path)
-        if original_img is None:
-            print(f"❌ Could not read image: {image_path}")
-            return False
-        
-        print(f"  Original image shape: {original_img.shape}")
-        
-        # Preprocess using same method as evaluation
-        ori_imgs, framed_imgs, framed_metas = preprocess(
-            [image_path],
-            max_size=input_size,
-            mean=params.mean,
-            std=params.std
-        )
-        
-        # Prepare input tensor
-        x = framed_imgs[0]
-        x = np.expand_dims(x, axis=0)  # Add batch dimension
-        x = np.transpose(x, (0, 3, 1, 2))  # Convert to NCHW
-        
-        print(f"  Preprocessed shape: {x.shape}")
-        print(f"  Input range: [{x.min():.3f}, {x.max():.3f}]")
-        
-    except Exception as e:
-        print(f"❌ Preprocessing failed: {e}")
-        return False
-    
-    # Run inference
-    print("Running inference...")
-    try:
-        start_time = time.time()
-        outputs = session.run(None, {input_name: x})
-        inference_time = time.time() - start_time
-        
-        boxes, scores, classes = outputs
-        print(f"✓ Inference successful in {inference_time*1000:.1f} ms")
-        print(f"  Output shapes: boxes={boxes.shape}, scores={scores.shape}, classes={classes.shape}")
-        
-    except Exception as e:
-        print(f"❌ Inference failed: {e}")
-        return False
-    
-    # Analyze outputs
-    print("Analyzing outputs...")
-    
-    # Get detections for first (and only) image
-    img_boxes = boxes[0]
-    img_scores = scores[0]
-    img_classes = classes[0]
-    
-    print(f"  Raw output ranges:")
-    print(f"    Boxes: [{img_boxes.min():.3f}, {img_boxes.max():.3f}]")
-    print(f"    Scores: [{img_scores.min():.3f}, {img_scores.max():.3f}]")
-    print(f"    Classes: [{img_classes.min():.0f}, {img_classes.max():.0f}]")
-    
-    # Filter by score threshold
-    valid_mask = img_scores > score_threshold
-    valid_count = np.sum(valid_mask)
-    
-    print(f"  Valid detections (score > {score_threshold}): {valid_count}")
-    
-    if valid_count == 0:
-        print("⚠ No detections above threshold. Try lowering score_threshold.")
-        # Show score distribution
-        sorted_scores = np.sort(img_scores[img_scores > 0])[::-1]  # Descending order
-        if len(sorted_scores) > 0:
-            print(f"  Top scores: {sorted_scores[:10]}")
-        return True
-    
-    # Get valid detections
-    valid_boxes = img_boxes[valid_mask]
-    valid_scores = img_scores[valid_mask]
-    valid_classes = img_classes[valid_mask]
-    
-    # Sort by score
-    sort_indices = np.argsort(valid_scores)[::-1]
-    valid_boxes = valid_boxes[sort_indices]
-    valid_scores = valid_scores[sort_indices]
-    valid_classes = valid_classes[sort_indices]
-    
-    print(f"  Top detections:")
-    for i in range(min(5, len(valid_scores))):
-        score = valid_scores[i]
-        class_id = int(valid_classes[i])
-        box = valid_boxes[i]
-        print(f"    Detection {i+1}: class={class_id}, score={score:.4f}, box=[{box[0]:.1f}, {box[1]:.1f}, {box[2]:.1f}, {box[3]:.1f}]")
-    
-    # Test different confidence thresholds
-    print(f"  Detection counts at different confidence thresholds:")
-    for conf_thresh in [0.001, 0.01, 0.05, 0.1, 0.3, 0.5]:
-        count = np.sum(valid_scores >= conf_thresh)
-        print(f"    >= {conf_thresh}: {count} detections")
-    
-    print(f"✅ Single image test completed successfully!")
-    print(f"💡 Suggested confidence threshold for evaluation: {suggest_confidence_threshold(valid_scores):.3f}")
-    
-    return True
+    return intersection / union if union > 0 else 0.0
 
-def suggest_confidence_threshold(scores):
-    """Suggest a good confidence threshold based on score distribution"""
-    if len(scores) == 0:
-        return 0.05
+
+def find_missed_detections(gt_boxes, gt_classes, pred_boxes, pred_classes, pred_scores, 
+                          iou_threshold=0.5, score_threshold=0.3):
+    """
+    Find ground truth boxes that were not detected by the model
+    """
+    missed_detections = []
     
-    # Use 75th percentile as a reasonable threshold
-    return float(np.percentile(scores, 75))
+    for i, (gt_box, gt_class) in enumerate(zip(gt_boxes, gt_classes)):
+        detected = False
+        
+        # Check if any prediction overlaps significantly with this ground truth
+        for pred_box, pred_class, pred_score in zip(pred_boxes, pred_classes, pred_scores):
+            if pred_score < score_threshold:
+                continue
+                
+            if pred_class == gt_class:  # Same class
+                iou = calculate_iou(gt_box, pred_box)
+                if iou >= iou_threshold:
+                    detected = True
+                    break
+        
+        if not detected:
+            missed_detections.append((gt_box, gt_class))
+    
+    return missed_detections
+
+
+def crop_and_save_missed_objects(image_path, missed_detections, obj_list, output_dir, image_name):
+    """
+    Crop missed objects from image and save them
+    """
+    # Read original image
+    image = cv2.imread(image_path)
+    if image is None:
+        print(f"Could not read image: {image_path}")
+        return
+    
+    for i, (bbox, class_id) in enumerate(missed_detections):
+        class_name = obj_list[int(class_id)]
+        
+        # Create class directory if it doesn't exist
+        class_dir = os.path.join(output_dir, class_name)
+        os.makedirs(class_dir, exist_ok=True)
+        
+        # Convert bbox to integers and ensure they're within image bounds
+        x1, y1, x2, y2 = map(int, bbox)
+        h, w = image.shape[:2]
+        x1 = max(0, min(x1, w-1))
+        y1 = max(0, min(y1, h-1))
+        x2 = max(x1+1, min(x2, w))
+        y2 = max(y1+1, min(y2, h))
+        
+        # Crop the object
+        cropped = image[y1:y2, x1:x2]
+        
+        if cropped.size > 0:
+            # Save the cropped object
+            filename = f"{image_name}_{class_name}_{i}.jpg"
+            output_path = os.path.join(class_dir, filename)
+            cv2.imwrite(output_path, cropped)
+            print(f"Saved missed detection: {output_path}")
+
 
 def main():
-    parser = argparse.ArgumentParser('Test ONNX Model on Single Image')
-    parser.add_argument('-m', '--model', type=str, required=True, help='Path to ONNX model')
-    parser.add_argument('-i', '--image', type=str, required=True, help='Path to test image')
-    parser.add_argument('-p', '--project', type=str, default='projects/abhil.yml', help='Project file')
-    parser.add_argument('-c', '--compound_coef', type=int, default=2, help='Compound coefficient')
-    parser.add_argument('--score_threshold', type=float, default=0.001, help='Score threshold')
+    parser = argparse.ArgumentParser('Check Missed Detections')
+    parser.add_argument('-p', '--project', type=str, default='abhil', help='project file that contains parameters')
+    parser.add_argument('-c', '--compound_coef', type=int, default=2, help='coefficients of efficientdet')
+    parser.add_argument('-w', '--weights', type=str, required=True, help='path to weights file')
+    parser.add_argument('--data_path', type=str, default='datasets/', help='path to dataset')
+    parser.add_argument('--output_dir', type=str, default='missed_detections', help='output directory for cropped images')
+    parser.add_argument('--iou_threshold', type=float, default=0.5, help='IoU threshold for considering detection')
+    parser.add_argument('--score_threshold', type=float, default=0.3, help='Score threshold for predictions')
+    parser.add_argument('--cuda', type=boolean_string, default=True, help='use cuda')
+    parser.add_argument('--device', type=int, default=0, help='cuda device')
+    parser.add_argument('--max_images', type=int, default=100, help='maximum number of images to process')
     
     args = parser.parse_args()
     
-    # Validate inputs
-    if not os.path.exists(args.model):
-        print(f"❌ ONNX model not found: {args.model}")
-        exit(1)
+    # Load parameters
+    params = yaml.safe_load(open(f'projects/{args.project}.yml'))
+    obj_list = params['obj_list']
     
-    if not os.path.exists(args.image):
-        print(f"❌ Test image not found: {args.image}")
-        exit(1)
+    input_sizes = [512, 640, 768, 896, 1024, 1280, 1280, 1536, 1536]
+    input_size = input_sizes[args.compound_coef]
     
-    if not os.path.exists(args.project):
-        print(f"❌ Project file not found: {args.project}")
-        exit(1)
+    print(f"Loading model with compound_coef: {args.compound_coef}")
+    print(f"Input size: {input_size}")
+    print(f"Classes: {obj_list}")
     
-    # Run test
-    success = test_single_image(
-        args.model, args.image, args.project, 
-        args.compound_coef, args.score_threshold
+    # Load model
+    model = EfficientDetBackbone(
+        compound_coef=args.compound_coef,
+        num_classes=len(obj_list),
+        ratios=eval(params['anchors_ratios']),
+        scales=eval(params['anchors_scales'])
     )
     
-    if success:
-        print(f"\n✅ Your ONNX model is working correctly!")
-        print(f"🚀 Ready for full evaluation with:")
-        print(f"   python evaluate_onnx_model.py -p abhil -c {args.compound_coef} -w {args.model}")
-    else:
-        print(f"\n❌ Issues detected with your ONNX model")
+    model.load_state_dict(torch.load(args.weights, map_location='cpu'))
+    model.eval()
+    model.requires_grad_(False)
+    
+    if args.cuda:
+        model = model.cuda(args.device)
+    
+    # Initialize transform functions
+    regressBoxes = BBoxTransform()
+    clipBoxes = ClipBoxes()
+    
+    if args.cuda:
+        regressBoxes = regressBoxes.cuda(args.device)
+        clipBoxes = clipBoxes.cuda(args.device)
+    
+    # Load COCO validation data
+    val_set_name = params['val_set']
+    coco_path = os.path.join(args.data_path, params['project_name'], 'annotations', f'instances_{val_set_name}.json')
+    images_path = os.path.join(args.data_path, params['project_name'], val_set_name)
+    
+    print(f"Loading COCO data from: {coco_path}")
+    coco = COCO(coco_path)
+    image_ids = coco.getImgIds()[:args.max_images]
+    
+    # Create output directory
+    os.makedirs(args.output_dir, exist_ok=True)
+    
+    missed_count_per_class = {class_name: 0 for class_name in obj_list}
+    total_objects_per_class = {class_name: 0 for class_name in obj_list}
+    
+    print(f"Processing {len(image_ids)} images...")
+    
+    for image_id in tqdm(image_ids, desc="Processing images"):
+        # Load image info
+        image_info = coco.loadImgs(image_id)[0]
+        image_path = os.path.join(images_path, image_info['file_name'])
+        image_name = os.path.splitext(image_info['file_name'])[0]
+        
+        if not os.path.exists(image_path):
+            print(f"Image not found: {image_path}")
+            continue
+        
+        # Load ground truth annotations
+        ann_ids = coco.getAnnIds(imgIds=image_id, iscrowd=False)
+        anns = coco.loadAnns(ann_ids)
+        
+        gt_boxes = []
+        gt_classes = []
+        
+        for ann in anns:
+            if ann['bbox'][2] < 1 or ann['bbox'][3] < 1:  # Skip invalid boxes
+                continue
+            
+            # Convert from [x, y, w, h] to [x1, y1, x2, y2]
+            x, y, w, h = ann['bbox']
+            gt_boxes.append([x, y, x + w, y + h])
+            gt_classes.append(ann['category_id'] - 1)  # Convert to 0-based indexing
+            
+            # Count total objects per class
+            class_name = obj_list[ann['category_id'] - 1]
+            total_objects_per_class[class_name] += 1
+        
+        if len(gt_boxes) == 0:
+            continue
+        
+        # Run inference
+        try:
+            ori_imgs, framed_imgs, framed_metas = preprocess(
+                [image_path], 
+                max_size=input_size,
+                mean=params['mean'], 
+                std=params['std']
+            )
+            
+            x = torch.from_numpy(framed_imgs[0])
+            if args.cuda:
+                x = x.cuda(args.device)
+            x = x.float().unsqueeze(0).permute(0, 3, 1, 2)
+            
+            # Get predictions
+            features, regression, classification, anchors = model(x)
+            
+            preds = postprocess(
+                x, anchors, regression, classification,
+                regressBoxes, clipBoxes,
+                threshold=args.score_threshold,
+                iou_threshold=0.5
+            )
+            
+            if len(preds) == 0 or len(preds[0]['rois']) == 0:
+                pred_boxes = []
+                pred_classes = []
+                pred_scores = []
+            else:
+                # Invert affine transformation to get original coordinates
+                preds = invert_affine(framed_metas, preds)
+                pred_boxes = preds[0]['rois']
+                pred_classes = preds[0]['class_ids']
+                pred_scores = preds[0]['scores'].flatten()
+        
+        except Exception as e:
+            print(f"Error processing image {image_path}: {e}")
+            continue
+        
+        # Find missed detections
+        missed_detections = find_missed_detections(
+            gt_boxes, gt_classes, pred_boxes, pred_classes, pred_scores,
+            iou_threshold=args.iou_threshold,
+            score_threshold=args.score_threshold
+        )
+        
+        # Count missed detections per class
+        for _, class_id in missed_detections:
+            class_name = obj_list[int(class_id)]
+            missed_count_per_class[class_name] += 1
+        
+        # Crop and save missed objects
+        if len(missed_detections) > 0:
+            crop_and_save_missed_objects(
+                image_path, missed_detections, obj_list, 
+                args.output_dir, image_name
+            )
+    
+    # Print summary statistics
+    print("\n" + "="*50)
+    print("MISSED DETECTION SUMMARY")
+    print("="*50)
+    for class_name in obj_list:
+        total = total_objects_per_class[class_name]
+        missed = missed_count_per_class[class_name]
+        if total > 0:
+            miss_rate = (missed / total) * 100
+            print(f"{class_name:15}: {missed:4d}/{total:4d} missed ({miss_rate:5.1f}%)")
+        else:
+            print(f"{class_name:15}: No objects found in validation set")
+    
+    print(f"\nCropped images saved to: {args.output_dir}")
+
 
 if __name__ == '__main__':
     main()
