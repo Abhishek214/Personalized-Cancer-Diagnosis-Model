@@ -1,30 +1,30 @@
-  try:
-        # Monitor before inference
-        process = psutil.Process(os.getpid())
-        
-        def log_resources(stage):
-            mem_info = process.memory_info()
-            mem_percent = process.memory_percent()
-            cpu_percent = process.cpu_percent(interval=0.1)
-            
-            self.logger.info(f"[{stage}] Memory: {mem_info.rss / 1024 / 1024:.2f} MB ({mem_percent:.1f}%), "
-                           f"CPU: {cpu_percent:.1f}%, "
-                           f"Available System Memory: {psutil.virtual_memory().available / 1024 / 1024:.2f} MB")
-        
-        model = get_model()
+    model = get_model()
         self.net = model['session']
-        self.logger.info("LOADED MODEL IMPORTED")
         
-        log_resources("Before mx.nd.array")
+        # CRITICAL: Reduce image size for GCP
+        original_shape = image.shape
+        max_dim = max(image.shape[0], image.shape[1])
+        
+        # Force smaller image for inference
+        if max_dim > 1024:  # Reduce from your current size
+            import cv2
+            scale = 1024 / max_dim
+            new_height = int(image.shape[0] * scale)
+            new_width = int(image.shape[1] * scale)
+            
+            self.logger.info(f"Resizing image from {original_shape} to ({new_height}, {new_width})")
+            image = cv2.resize(image, (new_width, new_height))
+        
         img_nd = mx.nd.array(image, ctx=mx.cpu())
         
-        log_resources("Before transform_test")
-        x, img = self.net.transform_test(img_nd, short=short)
+        # Use smaller short size for transform
+        x, img = self.net.transform_test(img_nd, short=512)  # Reduced from 1024
         
-        log_resources("Before inference")
-        # THIS IS WHERE IT LIKELY CRASHES - during model forward pass
-        class_IDs, scores, bounding_boxes = self.net(x)
+        # Inference with batch size 1
+        with mx.autograd.predict_mode():  # Ensure prediction mode
+            class_IDs, scores, bounding_boxes = self.net(x)
         
-        log_resources("After inference")
-        
-        # Rest of
+        # Scale bboxes back to original size if resized
+        if max_dim > 1024:
+            scale_back = max_dim / 1024
+            bounding_boxes = bounding_boxes * scale_back
