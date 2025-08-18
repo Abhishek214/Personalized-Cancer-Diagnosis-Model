@@ -1,0 +1,134 @@
+from source.detection.detection_feature_process import VisualFeatureDetection
+from PIL import Image
+import numpy as np
+from configurations.params import workers
+from utils.handle_log import process_feature_logger
+from model_utils.download_utils import download_models
+from source.detection.model_load import load_model, get_model
+import os
+import gluoncv as gcv
+from source.detection.model_load import load_model, get_model
+from configurations.params import CLASSES
+from configurations.params import SSD_TRAINED_MODEL_PATH, SSD_BASE_MODEL_PATH, CLASSES
+from routers.process_documents import get_model, load_model
+
+# Initialize model and check if models are downloaded
+model = get_model()
+
+def ensure_models_downloaded():
+    """
+    Ensure models are downloaded before running tests.
+    This function checks if required model files exist,
+    and downloads them if necessary.
+    """
+    required_files = [
+        SSD_BASE_MODEL_PATH,  # "/tmp/ssd_512_resnet101_v2_voc-2cc0f93e.params"
+        SSD_TRAINED_MODEL_PATH,  # "/tmp/ssd_512_resnet101_resume_train_four_classes_custom-epoch-26.params"
+        "/tmp/detection_model/efficientdet.onnx",
+        "/tmp/efficientdet_conf.yml"
+    ]
+    
+    # Check if all required files exist
+    all_files_exist = all(os.path.exists(file_path) for file_path in required_files)
+    
+    if not all_files_exist:
+        print(f"Models not found for worker PID: {os.getpid()}. Downloading...")
+        
+        # Set a dummy secret for testing if needed
+        # You might need to adjust this based on your authentication setup
+        from configurations.global_data import set_global_data
+        
+        # Check if the secret is already set
+        from configurations.global_data import get_global_data
+        if not get_global_data("dcrestai-gb-dcrest-svc-aco-doctager-pwd"):
+            # For testing, you might need to set this appropriately
+            # or pass it as an environment variable
+            secret_value = os.environ.get("MODEL_DOWNLOAD_SECRET", "")
+            if secret_value:
+                set_global_data("dcrestai-gb-dcrest-svc-aco-doctager-pwd", secret_value)
+                download_models("dcrestai-gb-dcrest-svc-aco-doctager-pwd")
+            else:
+                print("WARNING: MODEL_DOWNLOAD_SECRET not set. Cannot download models.")
+                print("Please set the environment variable or ensure models are pre-downloaded.")
+                raise Exception("Models not available and cannot download without credentials")
+        else:
+            # Secret already exists, proceed with download
+            download_models("dcrestai-gb-dcrest-svc-aco-doctager-pwd")
+    else:
+        print(f"Models already present for worker PID: {os.getpid()}")
+
+# Ensure models are downloaded before proceeding
+print("PVT started")
+ensure_models_downloaded()
+
+# Now load the model if not already loaded
+if 'net' not in model:
+    print("Loading model...")
+    load_model()
+    model = get_model()
+    
+net, sig_net = model['net'], model['sig_net']
+# Dlrn No : EDT-7849
+# This PVT is designed to test the mxnet model output.
+
+def iou(box1, box2):
+    # Calculate the coordinates of the intersection rectangle
+    x1 = max(box1[0], box2[0])
+    y1 = max(box1[1], box2[1])
+    x2 = min(box1[2], box2[2])
+    y2 = min(box1[3], box2[3])
+    
+    # Calculate the area of the intersection rectangle
+    inter_area = max(0, x2 - x1) * max(0, y2 - y1)
+    
+    # Calculate the area of both bounding boxes
+    box1_area = (box1[2] - box1[0]) * (box1[3] - box1[1])
+    box2_area = (box2[2] - box2[0]) * (box2[3] - box2[1])
+    
+    # Calculate the union area
+    union_area = box1_area + box2_area - inter_area
+    
+    # Return the IoU value (intersection area divided by union area)
+    return inter_area / union_area if union_area != 0 else 0
+
+def test_detection():
+    
+    # Load the test image
+    image = Image.open("./test/test_img.png")
+    
+    # Convert the image into a NumPy array for processing
+    image_array = np.array(image)
+    
+    # Initialize the VisualFeatureDetection class with logger and worker configurations
+    detection = VisualFeatureDetection(process_feature_logger, workers)
+    
+    # Perform detection on the image
+    det_data = detection.DetectImage(net, sig_net, image_array)
+    
+    # Define the expected bounding box coordinates
+    x1_orig, y1_orig, x2_orig, y2_orig = [97, 560, 255, 697]
+    
+    # Extract the detected bounding box coordinates and class label
+    y1, y2, x1, x2 = det_data[0]['bbox']
+    label = det_data[0]['class']
+    
+    # Assert that the detected class label matches the expected label
+    assert label.lower() == 'chop', "PVT Failed: Wrong class detected"
+    
+    # Assert that the IoU between the detected and expected bounding boxes is above the threshold (0.7)
+    assert iou([x1_orig, y1_orig, x2_orig, y2_orig], [x1, y1, x2, y2]) > 0.7, "PVT Failed: Wrong bbox prediction"
+    
+    # Print the test result if all assertions pass
+    print("PVT Passed")
+
+# Run the test detection function
+if __name__ == "__main__":
+    try:
+        test_detection()
+    except Exception as e:
+        print(f"PVT Failed with error: {e}")
+        import traceback
+        traceback.print_exc()
+        # Exit with error code for CI/CD pipelines
+        import sys
+        sys.exit(1)
