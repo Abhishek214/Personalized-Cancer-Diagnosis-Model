@@ -1,30 +1,197 @@
-    model = get_model()
-        self.net = model['session']
+# import pvt
+import sys
+import uvicorn
+import urllib3
+import platform
+import subprocess
+import os
+
+from fastapi import FastAPI, Request, WebSocket, Form, Header
+from fastapi.middleware.cors import CORSMiddleware
+from configurations.global_data import (set_global_data, get_all_global_data)
+from utils import keepie_utils
+from configurations.params import *
+from model_utils.download_utils import download_models
+from Auth.auth import secure
+from routers.process_documents import visual_dcrest
+from source.detection.model_load import load_model, get_model
+
+# Suppress InsecureRequestsWarning
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+app = FastAPI(root_path="/dcrest-visual-extraction-service")
+
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+uname = platform.uname()
+
+def get_uptime_millis():
+    with open("/proc/uptime", "r") as f:
+        uptime_seconds = float(f.readline().split()[0])
+    return int(uptime_seconds * 1000)
+
+def ensure_models_available():
+    """Ensure models are downloaded and available for each worker"""
+    try:
+        # Check if model files exist
+        model_files = [
+            "/tmp/skku_slm_resnet50_vd_ocr99.pt.params",
+            "/tmp/ssd_512_resnet101_v2_voc-2cc0f93e.params",
+            "/tmp/ssd_512_resnet101_resume_train_four_classes_custom-epoch-26.params"
+        ]
         
-        # CRITICAL: Reduce image size for GCP
-        original_shape = image.shape
-        max_dim = max(image.shape[0], image.shape[1])
+        missing_files = [f for f in model_files if not os.path.exists(f)]
         
-        # Force smaller image for inference
-        if max_dim > 1024:  # Reduce from your current size
-            import cv2
-            scale = 1024 / max_dim
-            new_height = int(image.shape[0] * scale)
-            new_width = int(image.shape[1] * scale)
+        if missing_files:
+            print(f"Missing model files: {missing_files}")
+            # Try to get credentials from environment or config
+            # You might need to modify this based on how you store credentials
+            return False
+        
+        return True
+    except Exception as e:
+        print(f"Error checking model files: {e}")
+        return False
+
+def initialize_worker():
+    """Initialize each worker with necessary models and data"""
+    try:
+        print(f"Initializing worker {os.getpid()}")
+        
+        # Check if models are available
+        if ensure_models_available():
+            print("Model files found, loading model...")
+            # Load the model for this worker
+            model = get_model()
+            if "session" not in model:
+                load_model()
+                print("Model loaded successfully in worker")
+            else:
+                print("Model already loaded in worker")
+        else:
+            print("Model files not found. Worker will wait for model download.")
             
-            self.logger.info(f"Resizing image from {original_shape} to ({new_height}, {new_width})")
-            image = cv2.resize(image, (new_width, new_height))
+    except Exception as e:
+        print(f"Error initializing worker: {e}")
+
+@app.on_event("startup")
+async def startup_event():
+    """Called when the application starts up"""
+    initialize_worker()
+
+uptime_millis = get_uptime_millis()
+version = os.getenv("APP_VERSION")
+
+@app.get("/health", status_code=200, description="Status report of api and system")
+def health():
+    return {
+        "healthy": "true",
+        "efimid": "9929948",
+        "server": uname.node,
+        "componentName": "dcrest-visual-extraction-service",
+        "version": version,
+        "description": "Description of this service",
+        "sourceCodeRepoUrl": "https://alm-github.wellsfargo.com/abcd/dcrest-visual-extraction-service",
+        "documentationUrl": "N/A",
+        "apiSpecificationUrl": "https://dcrest-visual-extraction-service-url/openapi.json",
+        "businessImpact": "This service has business impact",
+        "runtime": {
+            "name": "PYTHON",
+            "version": sys.version
+        },
+        "uptimeInMillis": uptime_millis
+    }
+
+@app.get("/docs", include_in_schema=False)
+async def custom_swagger_ui_html(req: Request):
+    root_path = req.scope.get("root_path", "").rstrip("/")
+    openapi_url = root_path + app.openapi_url
+    return get_swagger_ui_html(
+        openapi_url=openapi_url,
+        title="visual_detection",
+    )
+
+@app.get("/ready", status_code=200, description="Status report of api and system")
+def ready():
+    # Check if model is loaded
+    model = get_model()
+    model_status = "loaded" if "session" in model else "not_loaded"
+    
+    return {
+        "server": uname.node,
+        "service_name": "dcrest-visual-extraction-service",
+        "status": "alive",
+        "worker_pid": os.getpid(),
+        "model_status": model_status
+    }
+
+@app.post("/secret-receipt", status_code=200, description="Getting the secret keys")
+async def secret_receipt(secretName: str = Form(), secretValue: str = Form(), Content_Type: str = Header()):
+    print("secretName : ", secretName)
+    
+    """
+    Write data to config
+    """
+    if secretName and secretValue:
+        if secretName == "dcrestai-gb-dcrest-svc-aco-doctager-pwd":
+            set_global_data("dcrestai-gb-dcrest-svc-aco-doctager-pwd", secretValue)
+            print("Received password for dcrestai-gb-dcrest-svc-aco-doctager-pwd")
+
+            if not os.path.exists("/tmp/skku_slm_resnet50_vd_ocr99.pt.params"):
+                download_models("dcrestai-gb-dcrest-svc-aco-doctager-pwd")
+            else:
+                print("File already downloaded. Skipping download_models()")
+
+        if "dcrestai-gb-dcrest-svc-aco-pwd" in get_all_global_data().keys():
+            if "dcrestai-gb-svceco-doctage-pwd" in get_all_global_data().keys():
+                model = get_model()
+                if "session" not in model:
+                    load_model()
+                else:
+                    print("Model already loaded. Skipping model loading.")
+
+    # return the secret
+    return secretName, secretValue
+
+@app.post("/load-model", status_code=200, description="Force load model in this worker")
+async def load_model_endpoint():
+    """Endpoint to force load model in the current worker"""
+    try:
+        worker_pid = os.getpid()
+        print(f"Loading model in worker {worker_pid}")
         
-        img_nd = mx.nd.array(image, ctx=mx.cpu())
-        
-        # Use smaller short size for transform
-        x, img = self.net.transform_test(img_nd, short=512)  # Reduced from 1024
-        
-        # Inference with batch size 1
-        with mx.autograd.predict_mode():  # Ensure prediction mode
-            class_IDs, scores, bounding_boxes = self.net(x)
-        
-        # Scale bboxes back to original size if resized
-        if max_dim > 1024:
-            scale_back = max_dim / 1024
-            bounding_boxes = bounding_boxes * scale_back
+        model = get_model()
+        if "session" not in model:
+            load_model()
+            return {"status": "success", "message": f"Model loaded in worker {worker_pid}"}
+        else:
+            return {"status": "already_loaded", "message": f"Model already loaded in worker {worker_pid}"}
+            
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+# Routers
+app.include_router(secure)
+app.include_router(visual_dcrest)
+
+# Middleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+if __name__ == "__main__":
+    print("no of workers", workers)
+    uvicorn.run(
+        "Application:app",
+        host=host,
+        port=port,
+        log_level="debug",
+        # debug=True,
+        workers=workers,
+        # ssl_keyfile=ssl_keyfile,
+        # ssl_certfile=ssl_certfile,
+        # reload=True
+    )
