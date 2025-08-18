@@ -2,223 +2,191 @@ import requests
 import shutil
 import sys
 import os
+import fcntl
 import time
 import hashlib
-from pathlib import Path
 from configurations.params import NEXUS_DIR, NEXUS_USERNAME
 from configurations.global_data import get_global_data
 
-def calculate_file_hash(file_path, algorithm='md5'):
-    """Calculate hash of a file for integrity verification."""
-    hash_func = hashlib.new(algorithm)
-    with open(file_path, 'rb') as f:
-        for chunk in iter(lambda: f.read(4096), b""):
-            hash_func.update(chunk)
-    return hash_func.hexdigest()
-
-def download_with_retry(url, dest_path, max_retries=3, retry_delay=5):
-    """Download a file with retry logic."""
-    for attempt in range(max_retries):
+def acquire_lock(lock_file_path, timeout=300):
+    """
+    Acquire a file lock with timeout.
+    
+    Args:
+        lock_file_path: Path to the lock file
+        timeout: Maximum time to wait for lock in seconds
+    
+    Returns:
+        File handle if lock acquired, None if timeout
+    """
+    start_time = time.time()
+    lock_file = None
+    
+    while time.time() - start_time < timeout:
         try:
-            print(f"🔄 Download attempt {attempt + 1} of {max_retries}")
-            response = requests.get(url, stream=True, verify=False, timeout=120)
-            
-            if response.status_code == 200:
-                # Save the file with a temporary name first
-                temp_path = f"{dest_path}.tmp"
-                with open(temp_path, "wb") as file:
-                    for chunk in response.iter_content(chunk_size=8192):
-                        if chunk:
-                            file.write(chunk)
-                
-                # Move temp file to final destination
-                shutil.move(temp_path, dest_path)
-                print(f"✅ Download successful on attempt {attempt + 1}")
-                return True
-            else:
-                print(f"❌ Download failed with status code: {response.status_code}")
-                if attempt < max_retries - 1:
-                    print(f"⏳ Retrying in {retry_delay} seconds...")
-                    time.sleep(retry_delay)
-        
-        except requests.exceptions.RequestException as e:
-            print(f"❌ Download error on attempt {attempt + 1}: {e}")
-            if attempt < max_retries - 1:
-                print(f"⏳ Retrying in {retry_delay} seconds...")
-                time.sleep(retry_delay)
-        
-        except Exception as e:
-            print(f"❌ Unexpected error on attempt {attempt + 1}: {e}")
-            if attempt < max_retries - 1:
-                print(f"⏳ Retrying in {retry_delay} seconds...")
-                time.sleep(retry_delay)
+            # Create lock file if it doesn't exist
+            lock_file = open(lock_file_path, 'w')
+            # Try to acquire exclusive lock (non-blocking)
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            print(f"✅ Lock acquired by worker (PID: {os.getpid()})")
+            return lock_file
+        except IOError:
+            # Lock is held by another process
+            if lock_file:
+                lock_file.close()
+            print(f"⏳ Waiting for lock... (PID: {os.getpid()})")
+            time.sleep(2)  # Wait before retrying
     
-    return False
+    print(f"❌ Timeout waiting for lock (PID: {os.getpid()})")
+    return None
 
-def verify_extracted_files():
-    """Verify that extracted files are present and valid."""
-    expected_files = [
-        ("/tmp/skku_slm_resnet50_vd_ocr99.pt.params", 100),  # Minimum size in bytes
-        ("/tmp/ssd_512_resnet101_v2_voc-2cc0f93e.params", 100),
-        ("/tmp/ssd_512_resnet101_resume_train_four_classes_custom-epoch-26.params", 100),
-        ("/tmp/detection_model/efficientdet.onnx", 100),
-        ("/tmp/efficientdet_conf.yml", 10),
+def release_lock(lock_file):
+    """Release the file lock."""
+    if lock_file:
+        try:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+            lock_file.close()
+            print(f"🔓 Lock released by worker (PID: {os.getpid()})")
+        except Exception as e:
+            print(f"Error releasing lock: {e}")
+
+def check_models_completely_downloaded():
+    """
+    Check if all required model files are completely downloaded.
+    Returns True if all files exist and are valid.
+    """
+    required_files = [
+        "/tmp/ssd_512_resnet101_v2_voc-2cc0f93e.params",
+        "/tmp/ssd_512_resnet101_resume_train_four_classes_custom-epoch-26.params",
+        "/tmp/detection_model/efficientdet.onnx",
+        "/tmp/efficientdet_conf.yml",
+        "/tmp/en_core_web_sm-3.8.0/en_core_web_sm/en_core_web_sm-3.8.0/"
+        # Add other required model files here
     ]
     
-    expected_dirs = [
-        "/tmp/en_core_web_sm-3.8.0/en_core_web_sm/en_core_web_sm-3.8.0/",
-        "/tmp/detection_model/"
-    ]
-    
-    # Check directories
-    for dir_path in expected_dirs:
-        if not os.path.isdir(dir_path):
-            print(f"❌ Missing directory: {dir_path}")
+    for file_path in required_files:
+        if not os.path.exists(file_path):
             return False
-        if not os.access(dir_path, os.R_OK):
-            print(f"❌ Directory not readable: {dir_path}")
+        # Check if file has non-zero size (not corrupted/incomplete)
+        if os.path.isfile(file_path) and os.path.getsize(file_path) == 0:
             return False
     
-    # Check files
-    for file_path, min_size in expected_files:
-        if not os.path.isfile(file_path):
-            print(f"❌ Missing file: {file_path}")
-            return False
-        
-        file_size = os.path.getsize(file_path)
-        if file_size < min_size:
-            print(f"❌ File too small: {file_path} ({file_size} bytes)")
-            return False
-        
-        if not os.access(file_path, os.R_OK):
-            print(f"❌ File not readable: {file_path}")
-            return False
-    
-    print("✅ All extracted files verified successfully")
     return True
 
-def safe_extract(archive_path, extract_to="/tmp"):
-    """Safely extract archive with error handling."""
-    try:
-        # Create a temporary extraction directory
-        temp_extract_dir = f"{extract_to}/extract_temp_{os.getpid()}"
-        os.makedirs(temp_extract_dir, exist_ok=True)
-        
-        # Extract to temporary directory first
-        shutil.unpack_archive(archive_path, temp_extract_dir)
-        print(f"📦 Extracted to temporary directory: {temp_extract_dir}")
-        
-        # Move files from temp directory to final destination
-        for item in os.listdir(temp_extract_dir):
-            source = os.path.join(temp_extract_dir, item)
-            destination = os.path.join(extract_to, item)
-            
-            # Remove destination if it exists
-            if os.path.exists(destination):
-                if os.path.isdir(destination):
-                    shutil.rmtree(destination)
-                else:
-                    os.remove(destination)
-            
-            # Move from temp to final location
-            shutil.move(source, destination)
-            print(f"📁 Moved: {item} to {extract_to}")
-        
-        # Clean up temp directory
-        shutil.rmtree(temp_extract_dir, ignore_errors=True)
-        return True
-        
-    except shutil.ReadError as e:
-        print(f"❌ Error unpacking archive: {e}")
-        return False
-    except Exception as e:
-        print(f"❌ Unexpected error during extraction: {e}")
-        return False
-
-def clean_partial_downloads():
-    """Clean up any partial or temporary download files."""
-    patterns = [
-        "/tmp/*.tmp",
-        "/tmp/models.zip",
-        "/tmp/extract_temp_*"
-    ]
-    
-    import glob
-    for pattern in patterns:
-        for file_path in glob.glob(pattern):
-            try:
-                if os.path.isdir(file_path):
-                    shutil.rmtree(file_path, ignore_errors=True)
-                else:
-                    os.remove(file_path)
-                print(f"🗑️ Cleaned up: {file_path}")
-            except:
-                pass
-
 def download_models_with_lock(SA_keepie_key):
-    """Download models with proper error handling and verification."""
-    
-    # Clean up any partial downloads first
-    clean_partial_downloads()
-    
-    password = get_global_data(SA_keepie_key)
-    if not password:
-        print(f"❌ Failed to get password for key: {SA_keepie_key}")
-        return False
-    
-    url1 = f"https://{NEXUS_USERNAME}:{password}@nexus305.systems.uk.hsbc:8081/nexus/repository/maven-hsbc-gbm/com/hsbc/gbm/dcrest/992994/{NEXUS_DIR}/1.1/{NEXUS_DIR}-1.1.zip"
-    print(f"📍 Download URL prepared (credentials hidden)")
-    
-    temp_zip_path = "/tmp/models.zip"
+    """
+    Download models with file locking to ensure only one worker downloads.
+    """
+    lock_file_path = "/tmp/model_download.lock"
+    download_complete_marker = "/tmp/model_download.complete"
+    lock_file = None
     
     try:
-        # Download with retry
-        print("🔄 Starting model download...")
-        if not download_with_retry(url1, temp_zip_path):
-            print("❌ Failed to download models after all retries")
-            return False
+        # First, check if models are already completely downloaded
+        if check_models_completely_downloaded():
+            print(f"✅ Models already downloaded (PID: {os.getpid()})")
+            return True
         
-        # Verify download
-        if not os.path.exists(temp_zip_path):
-            print("❌ Downloaded file not found")
-            return False
+        # Check if download is in progress or completed by another worker
+        if os.path.exists(download_complete_marker):
+            # Wait a bit for ongoing download to complete
+            max_wait = 60
+            wait_time = 0
+            while wait_time < max_wait:
+                if check_models_completely_downloaded():
+                    print(f"✅ Models downloaded by another worker (PID: {os.getpid()})")
+                    return True
+                time.sleep(5)
+                wait_time += 5
         
-        file_size = os.path.getsize(temp_zip_path)
-        print(f"📊 Downloaded file size: {file_size:,} bytes")
+        # Acquire lock to download
+        lock_file = acquire_lock(lock_file_path)
+        if not lock_file:
+            raise Exception("Failed to acquire lock for model download")
         
-        if file_size < 1000:  # Minimum expected size
-            print("❌ Downloaded file is too small, likely corrupted")
-            return False
+        # Double-check after acquiring lock (another worker might have completed)
+        if check_models_completely_downloaded():
+            print(f"✅ Models already downloaded after acquiring lock (PID: {os.getpid()})")
+            return True
         
-        # Extract archive
-        print("📦 Extracting models...")
-        if not safe_extract(temp_zip_path, "/tmp"):
-            print("❌ Failed to extract models")
-            return False
+        # Create marker file to indicate download is in progress
+        with open(download_complete_marker, 'w') as f:
+            f.write(f"Download started by PID: {os.getpid()}")
         
-        # Verify extraction
-        if not verify_extracted_files():
-            print("❌ Extracted files verification failed")
-            return False
+        # Perform the actual download
+        print(f"🔄 Starting model download (PID: {os.getpid()})...")
+        download_models_internal(SA_keepie_key)
         
-        print("✅ Model download and extraction completed successfully")
+        # Update marker to indicate completion
+        with open(download_complete_marker, 'w') as f:
+            f.write(f"Download completed by PID: {os.getpid()}")
+        
+        print(f"✅ Model download completed (PID: {os.getpid()})")
         return True
         
     except Exception as e:
-        print(f"❌ Unexpected error in download_models: {e}")
-        import traceback
-        traceback.print_exc()
-        return False
-        
+        print(f"❌ Error in download_models_with_lock: {e}")
+        # Clean up marker file on error
+        if os.path.exists(download_complete_marker):
+            os.remove(download_complete_marker)
+        raise
     finally:
-        # Clean up zip file
-        if os.path.exists(temp_zip_path):
-            try:
-                os.remove(temp_zip_path)
-                print("🗑️ Cleaned up download archive")
-            except:
-                pass
+        # Always release the lock
+        if lock_file:
+            release_lock(lock_file)
 
+def download_models_internal(SA_keepie_key):
+    """
+    Internal function to perform the actual model download.
+    This is the original download_models function logic.
+    """
+    url1 = f"https://{NEXUS_USERNAME}:{get_global_data(SA_keepie_key)}@nexus305.systems.uk.hsbc:8081/nexus/repository/maven-hsbc-gbm/com/hsbc/gbm/dcrest/992994/{NEXUS_DIR}/1.1/{NEXUS_DIR}-1.1.zip"
+    print(f"url1: {url1}")
+
+    try:
+        # Perform the GET request
+        print("🔄 Downloading the Model...")
+        response = requests.get(url1, stream=True, verify=False)
+        print("HTTP Status Code", response.status_code)
+
+        # Check if the request was successful
+        if response.status_code == 200:
+            # Save the file locally
+            temp_zip_path = "/tmp/models.zip"
+            with open(temp_zip_path, "wb") as file:
+                for chunk in response.iter_content(chunk_size=8192):
+                    file.write(chunk)
+
+            # Unpack the archive
+            shutil.unpack_archive(temp_zip_path, "/tmp")
+            print("✅ Download and extraction complete.")
+
+            # Remove the temporary zip file
+            if os.path.isfile("/tmp/models.zip"):
+                os.remove("/tmp/models.zip")
+                print("🗑️ Removed the Downloaded ZIP")
+        else:
+            print(f"Failed to download file. HTTP Status Code: {response.status_code}")
+            raise Exception(f"Download failed with status code: {response.status_code}")
+
+    except requests.exceptions.RequestException as e:
+        print(f"An error occurred during the HTTP request: {e}")
+        raise
+    except shutil.ReadError as e:
+        print(f"An error occurred while unpacking the archive: {e}")
+        raise
+    except Exception as e:
+        print(f"An unexpected error occurred: {e}")
+        raise
+    finally:
+        if os.path.isfile("/tmp/models.zip"):
+            os.remove("/tmp/models.zip")
+            print("🗑️ Removed the Downloaded ZIP")
+
+# Wrapper function to maintain backward compatibility
 def download_models(SA_keepie_key):
-    """Legacy function for backward compatibility."""
+    """
+    Main entry point for downloading models.
+    Uses file locking to ensure only one worker downloads.
+    """
     return download_models_with_lock(SA_keepie_key)
