@@ -1,53 +1,209 @@
-# Updated /secret-receipt endpoint in Application.py
-# Replace the existing secret-receipt endpoint with this version
+from source.detection.detection_feature_process import VisualFeatureDetection
+from PIL import Image
+import numpy as np
+from configurations.params import workers
+from utils.handle_log import process_feature_logger
+from model_utils.download_models import download_models
+from source.detection.model_load import load_model, get_model
+import os
+import gluoncv as gcv
+from source.detection.model_load import load_model, get_model
+from configurations.params import CLASSES
+from configurations.params import SSD_TRAINED_MODEL_PATH, SSD_BASE_MODEL_PATH, CLASSES
+from routers.process_documents import get_model, load_model
+import sys
+import time
 
-@app.post("/secret-receipt", status_code=200, description="Getting the secret keys")
-async def secret_receipt(secretName: str = Form(), secretValue: str = Form(), Content_Type: str = Header()):
-    print(f"secretName : {secretName} (PID: {os.getpid()})")
+def check_models_exist():
+    """Check if all required model files exist."""
+    required_files = [
+        SSD_BASE_MODEL_PATH,  # "/tmp/ssd_512_resnet101_v2_voc-2cc0f93e.params"
+        SSD_TRAINED_MODEL_PATH,  # "/tmp/ssd_512_resnet101_resume_train_four_classes_custom-epoch-26.params"
+        "/tmp/detection_model/efficientdet.onnx",
+        "/tmp/efficientdet_conf.yml",
+        "/tmp/en_core_web_sm-3.8.0/en_core_web_sm/en_core_web_sm-3.8.0/"
+    ]
+    
+    for file_path in required_files:
+        if not os.path.exists(file_path):
+            print(f"❌ Missing model file: {file_path}")
+            return False
+        # Check file is not empty
+        if os.path.isfile(file_path) and os.path.getsize(file_path) == 0:
+            print(f"❌ Empty model file: {file_path}")
+            return False
+    
+    print("✅ All model files present")
+    return True
 
-    """
-    Write data to config
-    """
-    if secretName and secretValue:
-        if secretName == "dcrestai-gb-dcrest-svc-aco-doctager-pwd":
-            set_global_data("dcrestai-gb-dcrest-svc-aco-doctager-pwd", secretValue)
-            print(f"Received password for dcrestai-gb-dcrest-svc-aco-doctager-pwd (PID: {os.getpid()})")
+def wait_for_models(timeout=300):
+    """Wait for models to be downloaded by another process."""
+    print(f"⏳ Waiting for models to be downloaded (timeout: {timeout}s)...")
+    start_time = time.time()
+    
+    while time.time() - start_time < timeout:
+        if check_models_exist():
+            return True
+        
+        # Check if download is in progress
+        if os.path.exists("/tmp/model_download.complete"):
+            print("📥 Model download in progress by another process...")
+        
+        time.sleep(5)
+    
+    print(f"❌ Timeout waiting for models after {timeout} seconds")
+    return False
 
-            # Check if any model file exists as a quick check
-            # The actual complete check will be done in download_models
-            model_marker_file = "/tmp/model_download.complete"
-            quick_check_file = "/tmp/ssd_512_resnet101_v2_voc-2cc0f93e.params"
-            
-            if not os.path.exists(quick_check_file) and not os.path.exists(model_marker_file):
-                print(f"Models not found, initiating download (PID: {os.getpid()})")
-                try:
-                    download_models("dcrestai-gb-dcrest-svc-aco-doctager-pwd")
-                except Exception as e:
-                    print(f"Error downloading models: {e}")
-                    # Don't fail the request, let other workers try
-            else:
-                print(f"Models appear to be present or download in progress, skipping download (PID: {os.getpid()})")
+def ensure_models_available():
+    """Ensure models are available before running tests."""
+    print(f"🔍 Checking model availability (PID: {os.getpid()})...")
+    
+    # First check if models already exist
+    if check_models_exist():
+        print("✅ Models already available")
+        return True
+    
+    # Check if download is in progress
+    download_marker = "/tmp/model_download.complete"
+    lock_file = "/tmp/model_download.lock"
+    
+    if os.path.exists(download_marker) or os.path.exists(lock_file):
+        print("📥 Model download detected in progress...")
+        if wait_for_models():
+            return True
+        else:
+            print("❌ Models not available after waiting")
+            return False
+    
+    # If no download in progress and models don't exist, initiate download
+    print("🚀 Initiating model download...")
+    try:
+        # You'll need to provide the correct keepie key here
+        # This should ideally come from environment or config
+        keepie_key = "dcrestai-gb-dcrest-svc-aco-doctager-pwd"
+        
+        # Check if we have the secret value
+        from configurations.global_data import get_global_data
+        secret_value = get_global_data(keepie_key)
+        
+        if not secret_value:
+            print("⚠️ Warning: Secret key not available for download")
+            print("💡 Tip: Ensure the secret-receipt endpoint has been called first")
+            return False
+        
+        download_models(keepie_key)
+        return check_models_exist()
+        
+    except Exception as e:
+        print(f"❌ Error downloading models: {e}")
+        return False
 
-        # Model loading logic
-        if "dcrestai-gb-dcrest-svc-aco-pwd" in get_all_global_data().keys():
-            if "dcrestai-gb-svceco-doctage-pwd" in get_all_global_data().keys():
-                model = get_model()
-                if "session" not in model:
-                    # Add a small delay for other workers to allow model download to complete
-                    import time
-                    time.sleep(2)
-                    
-                    # Check if models are downloaded before trying to load
-                    if os.path.exists("/tmp/ssd_512_resnet101_v2_voc-2cc0f93e.params"):
-                        try:
-                            load_model()
-                            print(f"Model loaded successfully (PID: {os.getpid()})")
-                        except Exception as e:
-                            print(f"Error loading model: {e} (PID: {os.getpid()})")
-                    else:
-                        print(f"Model files not yet available for loading (PID: {os.getpid()})")
-                else:
-                    print(f"Model already loaded. Skipping model loading. (PID: {os.getpid()})")
+# Ensure models are available before importing model-dependent modules
+print("=" * 50)
+print("PVT Test Script Starting")
+print("=" * 50)
 
-    # return the secret
-    return secretName, secretValue
+# Check and ensure models are available
+if not ensure_models_available():
+    print("❌ FATAL: Models not available. Cannot run tests.")
+    print("Please ensure:")
+    print("1. The application has been started and secrets have been received")
+    print("2. Models have been successfully downloaded")
+    print("3. You have sufficient permissions to access /tmp")
+    sys.exit(1)
+
+# Now load the model
+model = get_model()
+if 'net' not in model:
+    print("🔄 Loading model into memory...")
+    load_model()
+    model = get_model()
+    
+net, sig_net = model['net'], model['sig_net']
+# Dino No : EDT-7849
+# This PVT is designed to test the mxnet model output.
+
+print("PVT started")
+
+def iou(box1, box2):
+    # Calculate the coordinates of the intersection rectangle
+    x1 = max(box1[0], box2[0])
+    y1 = max(box1[1], box2[1])
+    x2 = min(box1[2], box2[2])
+    y2 = min(box1[3], box2[3])
+    
+    # Calculate the area of the intersection rectangle
+    inter_area = max(0, x2 - x1) * max(0, y2 - y1)
+    
+    # Calculate the area of both bounding boxes
+    box1_area = (box1[2] - box1[0]) * (box1[3] - box1[1])
+    box2_area = (box2[2] - box2[0]) * (box2[3] - box2[1])
+    
+    # Calculate the union area
+    union_area = box1_area + box2_area - inter_area
+    
+    # Return the IoU value (intersection area divided by union area)
+    return inter_area / union_area if union_area != 0 else 0
+
+def test_detection():
+    try:
+        # Load the test image
+        image = Image.open("./test/test_img.png")
+        
+        # Convert the image into a NumPy array for processing
+        image_array = np.array(image)
+        
+        # Initialize the VisualFeatureDetection class with logger and worker configurations
+        detection = VisualFeatureDetection(process_feature_logger, workers)
+        
+        # Perform detection on the image
+        det_data = detection.DetectImage(net, sig_net, image_array)
+        
+        # Define the expected bounding box coordinates
+        x1_orig, y1_orig, x2_orig, y2_orig = [97, 560, 255, 697]
+        
+        # Extract the detected bounding box coordinates and class label
+        y1, y2, x1, x2 = det_data[0]["bbox"]
+        label = det_data[0]["class"]
+        
+        # Assert that the detected class label matches the expected label
+        assert label.lower() == 'chop', "PVT Failed: Wrong class detected"
+        
+        # Assert that the IoU between the detected and expected bounding boxes is above the threshold (0.7)
+        assert iou([x1_orig, y1_orig, x2_orig, y2_orig], [x1, y1, x2, y2]) > 0.7, "PVT Failed: Wrong bbox prediction"
+        
+        # Print the test result if all assertions pass
+        print("✅ PVT Passed")
+        return True
+        
+    except FileNotFoundError:
+        print("❌ Test image not found: ./test/test_img.png")
+        print("Please ensure test image is in the correct location")
+        return False
+    except IndexError:
+        print("❌ No detections found in the image")
+        print(f"Detection results: {det_data}")
+        return False
+    except AssertionError as e:
+        print(f"❌ Assertion failed: {e}")
+        return False
+    except Exception as e:
+        print(f"❌ Unexpected error in test_detection: {e}")
+        import traceback
+        traceback.print_exc()
+        return False
+
+# Run the test detection function
+if __name__ == "__main__":
+    print("-" * 50)
+    print("Running detection test...")
+    print("-" * 50)
+    
+    success = test_detection()
+    
+    if success:
+        print("\n🎉 All tests passed successfully!")
+        sys.exit(0)
+    else:
+        print("\n❌ Tests failed!")
+        sys.exit(1)
