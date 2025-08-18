@@ -5,6 +5,8 @@ import urllib3
 import platform
 import subprocess
 import os
+import requests
+import time
 
 from fastapi import FastAPI, Request, WebSocket, Form, Header
 from fastapi.middleware.cors import CORSMiddleware
@@ -29,57 +31,71 @@ def get_uptime_millis():
         uptime_seconds = float(f.readline().split()[0])
     return int(uptime_seconds * 1000)
 
-def ensure_models_available():
-    """Ensure models are downloaded and available for each worker"""
+def initialize_worker_models():
+    """Initialize models in current worker"""
+    worker_pid = os.getpid()
     try:
+        print(f"Initializing models in worker {worker_pid}")
+        
         # Check if model files exist
-        model_files = [
-            "/tmp/skku_slm_resnet50_vd_ocr99.pt.params",
-            "/tmp/ssd_512_resnet101_v2_voc-2cc0f93e.params",
-            "/tmp/ssd_512_resnet101_resume_train_four_classes_custom-epoch-26.params"
-        ]
-        
-        missing_files = [f for f in model_files if not os.path.exists(f)]
-        
-        if missing_files:
-            print(f"Missing model files: {missing_files}")
-            # Try to get credentials from environment or config
-            # You might need to modify this based on how you store credentials
-            return False
-        
-        return True
-    except Exception as e:
-        print(f"Error checking model files: {e}")
-        return False
-
-def initialize_worker():
-    """Initialize each worker with necessary models and data"""
-    try:
-        print(f"Initializing worker {os.getpid()}")
-        
-        # Check if models are available
-        if ensure_models_available():
-            print("Model files found, loading model...")
-            # Load the model for this worker
+        if os.path.exists("/tmp/skku_slm_resnet50_vd_ocr99.pt.params"):
             model = get_model()
             if "session" not in model:
                 load_model()
-                print("Model loaded successfully in worker")
+                print(f"Model loaded successfully in worker {worker_pid}")
             else:
-                print("Model already loaded in worker")
+                print(f"Model already loaded in worker {worker_pid}")
         else:
-            print("Model files not found. Worker will wait for model download.")
+            print(f"Model files not found in worker {worker_pid}")
             
     except Exception as e:
-        print(f"Error initializing worker: {e}")
+        print(f"Error initializing worker {worker_pid}: {e}")
 
-@app.on_event("startup")
-async def startup_event():
-    """Called when the application starts up"""
-    initialize_worker()
+def initialize_all_workers():
+    """Call initialization endpoint to hit all workers"""
+    try:
+        # Make multiple requests to ensure all workers are hit
+        base_url = f"http://localhost:{port}"
+        init_url = f"{base_url}/init-worker"
+        
+        print("Initializing all workers...")
+        
+        # Make enough requests to hit all workers (workers * 2 to be safe)
+        for i in range(workers * 3):
+            try:
+                response = requests.get(init_url, timeout=5)
+                if response.status_code == 200:
+                    data = response.json()
+                    print(f"Initialized worker {data.get('worker_pid', 'unknown')}")
+                time.sleep(0.1)  # Small delay between requests
+            except Exception as e:
+                print(f"Request {i+1} failed: {e}")
+                
+        print("Worker initialization complete")
+        
+    except Exception as e:
+        print(f"Error initializing all workers: {e}")
 
 uptime_millis = get_uptime_millis()
 version = os.getenv("APP_VERSION")
+
+@app.get("/init-worker", status_code=200, description="Initialize current worker")
+def init_worker():
+    """Endpoint to initialize the current worker - called multiple times to hit all workers"""
+    worker_pid = os.getpid()
+    
+    # Initialize this worker
+    initialize_worker_models()
+    
+    # Check if model is loaded
+    model = get_model()
+    model_status = "loaded" if "session" in model else "not_loaded"
+    
+    return {
+        "worker_pid": worker_pid,
+        "model_status": model_status,
+        "message": f"Worker {worker_pid} initialized"
+    }
 
 @app.get("/health", status_code=200, description="Status report of api and system")
 def health():
@@ -115,21 +131,22 @@ def ready():
     # Check if model is loaded
     model = get_model()
     model_status = "loaded" if "session" in model else "not_loaded"
+    worker_pid = os.getpid()
     
     return {
         "server": uname.node,
         "service_name": "dcrest-visual-extraction-service",
         "status": "alive",
-        "worker_pid": os.getpid(),
+        "worker_pid": worker_pid,
         "model_status": model_status
     }
 
 @app.post("/secret-receipt", status_code=200, description="Getting the secret keys")
 async def secret_receipt(secretName: str = Form(), secretValue: str = Form(), Content_Type: str = Header()):
     print("secretName : ", secretName)
-    
+
     """
-    Write data to config
+    Write data to config and initialize ALL workers
     """
     if secretName and secretValue:
         if secretName == "dcrestai-gb-dcrest-svc-aco-doctager-pwd":
@@ -137,37 +154,27 @@ async def secret_receipt(secretName: str = Form(), secretValue: str = Form(), Co
             print("Received password for dcrestai-gb-dcrest-svc-aco-doctager-pwd")
 
             if not os.path.exists("/tmp/skku_slm_resnet50_vd_ocr99.pt.params"):
+                print("Downloading models...")
                 download_models("dcrestai-gb-dcrest-svc-aco-doctager-pwd")
+                print("Model download complete")
             else:
                 print("File already downloaded. Skipping download_models()")
 
+        # Check if we have all required secrets
         if "dcrestai-gb-dcrest-svc-aco-pwd" in get_all_global_data().keys():
             if "dcrestai-gb-svceco-doctage-pwd" in get_all_global_data().keys():
-                model = get_model()
-                if "session" not in model:
-                    load_model()
-                else:
-                    print("Model already loaded. Skipping model loading.")
+                print("All secrets received. Initializing all workers...")
+                
+                # Initialize current worker first
+                initialize_worker_models()
+                
+                # Then initialize all other workers
+                initialize_all_workers()
+                
+                print("All workers initialization triggered")
 
     # return the secret
     return secretName, secretValue
-
-@app.post("/load-model", status_code=200, description="Force load model in this worker")
-async def load_model_endpoint():
-    """Endpoint to force load model in the current worker"""
-    try:
-        worker_pid = os.getpid()
-        print(f"Loading model in worker {worker_pid}")
-        
-        model = get_model()
-        if "session" not in model:
-            load_model()
-            return {"status": "success", "message": f"Model loaded in worker {worker_pid}"}
-        else:
-            return {"status": "already_loaded", "message": f"Model already loaded in worker {worker_pid}"}
-            
-    except Exception as e:
-        return {"status": "error", "message": str(e)}
 
 # Routers
 app.include_router(secure)
