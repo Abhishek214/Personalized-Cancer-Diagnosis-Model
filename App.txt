@@ -1,209 +1,124 @@
-from source.detection.detection_feature_process import VisualFeatureDetection
-from PIL import Image
-import numpy as np
-from configurations.params import workers
-from utils.handle_log import process_feature_logger
-from model_utils.download_models import download_models
-from source.detection.model_load import load_model, get_model
-import os
-import gluoncv as gcv
-from source.detection.model_load import load_model, get_model
-from configurations.params import CLASSES
-from configurations.params import SSD_TRAINED_MODEL_PATH, SSD_BASE_MODEL_PATH, CLASSES
-from routers.process_documents import get_model, load_model
-import sys
-import time
+def calculate_bbox_area(bbox):
+    """
+    Calculate the area of a bounding box.
+    
+    Args:
+        bbox: List or tuple in format [xmin, ymin, xmax, ymax]
+        
+    Returns:
+        float: Area of the bounding box
+    """
+    xmin, ymin, xmax, ymax = bbox
+    width = max(0, xmax - xmin)
+    height = max(0, ymax - ymin)
+    return width * height
 
-def check_models_exist():
-    """Check if all required model files exist."""
-    required_files = [
-        SSD_BASE_MODEL_PATH,  # "/tmp/ssd_512_resnet101_v2_voc-2cc0f93e.params"
-        SSD_TRAINED_MODEL_PATH,  # "/tmp/ssd_512_resnet101_resume_train_four_classes_custom-epoch-26.params"
-        "/tmp/detection_model/efficientdet.onnx",
-        "/tmp/efficientdet_conf.yml",
-        "/tmp/en_core_web_sm-3.8.0/en_core_web_sm/en_core_web_sm-3.8.0/"
-    ]
+def calculate_iou(bbox1, bbox2):
+    """
+    Calculate Intersection over Union (IoU) of two bounding boxes.
     
-    for file_path in required_files:
-        if not os.path.exists(file_path):
-            print(f"❌ Missing model file: {file_path}")
-            return False
-        # Check file is not empty
-        if os.path.isfile(file_path) and os.path.getsize(file_path) == 0:
-            print(f"❌ Empty model file: {file_path}")
-            return False
+    Args:
+        bbox1: List or tuple in format [xmin, ymin, xmax, ymax]
+        bbox2: List or tuple in format [xmin, ymin, xmax, ymax]
+        
+    Returns:
+        float: IoU value between 0 and 1
+    """
+    x1_min, y1_min, x1_max, y1_max = bbox1
+    x2_min, y2_min, x2_max, y2_max = bbox2
     
-    print("✅ All model files present")
-    return True
+    # Calculate intersection coordinates
+    inter_xmin = max(x1_min, x2_min)
+    inter_ymin = max(y1_min, y2_min)
+    inter_xmax = min(x1_max, x2_max)
+    inter_ymax = min(y1_max, y2_max)
+    
+    # Check if there's any intersection
+    if inter_xmin >= inter_xmax or inter_ymin >= inter_ymax:
+        return 0.0
+    
+    # Calculate intersection area
+    intersection_area = (inter_xmax - inter_xmin) * (inter_ymax - inter_ymin)
+    
+    # Calculate union area
+    bbox1_area = calculate_bbox_area(bbox1)
+    bbox2_area = calculate_bbox_area(bbox2)
+    union_area = bbox1_area + bbox2_area - intersection_area
+    
+    # Avoid division by zero
+    if union_area == 0:
+        return 0.0
+    
+    return intersection_area / union_area
 
-def wait_for_models(timeout=300):
-    """Wait for models to be downloaded by another process."""
-    print(f"⏳ Waiting for models to be downloaded (timeout: {timeout}s)...")
-    start_time = time.time()
+def remove_duplicate_detections(detections, iou_threshold=0.3, class_filter=None):
+    """
+    Remove duplicate detections by keeping the detection with the larger bounding box
+    when IoU exceeds the threshold.
     
-    while time.time() - start_time < timeout:
-        if check_models_exist():
-            return True
+    Args:
+        detections: List of detection dictionaries with 'class', 'bbox', 'score' keys
+        iou_threshold: float, IoU threshold for considering detections as duplicates (default: 0.3)
+        class_filter: str or None, only process detections of this class (e.g., 'signature')
         
-        # Check if download is in progress
-        if os.path.exists("/tmp/model_download.complete"):
-            print("📥 Model download in progress by another process...")
-        
-        time.sleep(5)
+    Returns:
+        List: Filtered detections with duplicates removed
+    """
+    if not detections:
+        return detections
     
-    print(f"❌ Timeout waiting for models after {timeout} seconds")
-    return False
-
-def ensure_models_available():
-    """Ensure models are available before running tests."""
-    print(f"🔍 Checking model availability (PID: {os.getpid()})...")
-    
-    # First check if models already exist
-    if check_models_exist():
-        print("✅ Models already available")
-        return True
-    
-    # Check if download is in progress
-    download_marker = "/tmp/model_download.complete"
-    lock_file = "/tmp/model_download.lock"
-    
-    if os.path.exists(download_marker) or os.path.exists(lock_file):
-        print("📥 Model download detected in progress...")
-        if wait_for_models():
-            return True
-        else:
-            print("❌ Models not available after waiting")
-            return False
-    
-    # If no download in progress and models don't exist, initiate download
-    print("🚀 Initiating model download...")
-    try:
-        # You'll need to provide the correct keepie key here
-        # This should ideally come from environment or config
-        keepie_key = "dcrestai-gb-dcrest-svc-aco-doctager-pwd"
-        
-        # Check if we have the secret value
-        from configurations.global_data import get_global_data
-        secret_value = get_global_data(keepie_key)
-        
-        if not secret_value:
-            print("⚠️ Warning: Secret key not available for download")
-            print("💡 Tip: Ensure the secret-receipt endpoint has been called first")
-            return False
-        
-        download_models(keepie_key)
-        return check_models_exist()
-        
-    except Exception as e:
-        print(f"❌ Error downloading models: {e}")
-        return False
-
-# Ensure models are available before importing model-dependent modules
-print("=" * 50)
-print("PVT Test Script Starting")
-print("=" * 50)
-
-# Check and ensure models are available
-if not ensure_models_available():
-    print("❌ FATAL: Models not available. Cannot run tests.")
-    print("Please ensure:")
-    print("1. The application has been started and secrets have been received")
-    print("2. Models have been successfully downloaded")
-    print("3. You have sufficient permissions to access /tmp")
-    sys.exit(1)
-
-# Now load the model
-model = get_model()
-if 'net' not in model:
-    print("🔄 Loading model into memory...")
-    load_model()
-    model = get_model()
-    
-net, sig_net = model['net'], model['sig_net']
-# Dino No : EDT-7849
-# This PVT is designed to test the mxnet model output.
-
-print("PVT started")
-
-def iou(box1, box2):
-    # Calculate the coordinates of the intersection rectangle
-    x1 = max(box1[0], box2[0])
-    y1 = max(box1[1], box2[1])
-    x2 = min(box1[2], box2[2])
-    y2 = min(box1[3], box2[3])
-    
-    # Calculate the area of the intersection rectangle
-    inter_area = max(0, x2 - x1) * max(0, y2 - y1)
-    
-    # Calculate the area of both bounding boxes
-    box1_area = (box1[2] - box1[0]) * (box1[3] - box1[1])
-    box2_area = (box2[2] - box2[0]) * (box2[3] - box2[1])
-    
-    # Calculate the union area
-    union_area = box1_area + box2_area - inter_area
-    
-    # Return the IoU value (intersection area divided by union area)
-    return inter_area / union_area if union_area != 0 else 0
-
-def test_detection():
-    try:
-        # Load the test image
-        image = Image.open("./test/test_img.png")
-        
-        # Convert the image into a NumPy array for processing
-        image_array = np.array(image)
-        
-        # Initialize the VisualFeatureDetection class with logger and worker configurations
-        detection = VisualFeatureDetection(process_feature_logger, workers)
-        
-        # Perform detection on the image
-        det_data = detection.DetectImage(net, sig_net, image_array)
-        
-        # Define the expected bounding box coordinates
-        x1_orig, y1_orig, x2_orig, y2_orig = [97, 560, 255, 697]
-        
-        # Extract the detected bounding box coordinates and class label
-        y1, y2, x1, x2 = det_data[0]["bbox"]
-        label = det_data[0]["class"]
-        
-        # Assert that the detected class label matches the expected label
-        assert label.lower() == 'chop', "PVT Failed: Wrong class detected"
-        
-        # Assert that the IoU between the detected and expected bounding boxes is above the threshold (0.7)
-        assert iou([x1_orig, y1_orig, x2_orig, y2_orig], [x1, y1, x2, y2]) > 0.7, "PVT Failed: Wrong bbox prediction"
-        
-        # Print the test result if all assertions pass
-        print("✅ PVT Passed")
-        return True
-        
-    except FileNotFoundError:
-        print("❌ Test image not found: ./test/test_img.png")
-        print("Please ensure test image is in the correct location")
-        return False
-    except IndexError:
-        print("❌ No detections found in the image")
-        print(f"Detection results: {det_data}")
-        return False
-    except AssertionError as e:
-        print(f"❌ Assertion failed: {e}")
-        return False
-    except Exception as e:
-        print(f"❌ Unexpected error in test_detection: {e}")
-        import traceback
-        traceback.print_exc()
-        return False
-
-# Run the test detection function
-if __name__ == "__main__":
-    print("-" * 50)
-    print("Running detection test...")
-    print("-" * 50)
-    
-    success = test_detection()
-    
-    if success:
-        print("\n🎉 All tests passed successfully!")
-        sys.exit(0)
+    # Filter detections by class if specified
+    if class_filter:
+        target_detections = [det for det in detections if det['class'].lower() == class_filter.lower()]
+        other_detections = [det for det in detections if det['class'].lower() != class_filter.lower()]
     else:
-        print("\n❌ Tests failed!")
-        sys.exit(1)
+        target_detections = detections.copy()
+        other_detections = []
+    
+    if len(target_detections) <= 1:
+        return detections
+    
+    # Sort detections by area (largest first) to prioritize keeping larger boxes
+    target_detections_with_area = []
+    for det in target_detections:
+        area = calculate_bbox_area(det['bbox'])
+        target_detections_with_area.append((det, area))
+    
+    target_detections_with_area.sort(key=lambda x: x[1], reverse=True)
+    
+    # Keep track of detections to keep
+    filtered_detections = []
+    
+    for i, (current_det, current_area) in enumerate(target_detections_with_area):
+        is_duplicate = False
+        
+        # Check against all previously kept detections
+        for kept_det in filtered_detections:
+            iou = calculate_iou(current_det['bbox'], kept_det['bbox'])
+            
+            if iou > iou_threshold:
+                # Current detection is a duplicate
+                is_duplicate = True
+                break
+        
+        # If not a duplicate, keep this detection
+        if not is_duplicate:
+            filtered_detections.append(current_det)
+    
+    # Combine filtered target detections with other class detections
+    final_detections = filtered_detections + other_detections
+    
+    return final_detections
+
+def remove_signature_duplicates(detections, iou_threshold=0.3):
+    """
+    Convenience function specifically for removing duplicate signature detections.
+    
+    Args:
+        detections: List of detection dictionaries
+        iou_threshold: float, IoU threshold for considering detections as duplicates
+        
+    Returns:
+        List: Detections with duplicate signatures removed
+    """
+    return remove_duplicate_detections(detections, iou_threshold, class_filter='signature')
