@@ -13,16 +13,17 @@ def calculate_bbox_area(bbox):
     height = max(0, ymax - ymin)
     return width * height
 
-def calculate_iou(bbox1, bbox2):
+def calculate_intersection_percentage(bbox1, bbox2):
     """
-    Calculate Intersection over Union (IoU) of two bounding boxes.
+    Calculate intersection percentage of the smaller bounding box.
+    This is better than IoU for detecting when one box is inside another.
     
     Args:
         bbox1: List or tuple in format [xmin, ymin, xmax, ymax]
         bbox2: List or tuple in format [xmin, ymin, xmax, ymax]
         
     Returns:
-        float: IoU value between 0 and 1
+        float: Intersection percentage (0 to 1) based on the smaller box
     """
     x1_min, y1_min, x1_max, y1_max = bbox1
     x2_min, y2_min, x2_max, y2_max = bbox2
@@ -40,25 +41,65 @@ def calculate_iou(bbox1, bbox2):
     # Calculate intersection area
     intersection_area = (inter_xmax - inter_xmin) * (inter_ymax - inter_ymin)
     
-    # Calculate union area
+    # Calculate areas of both boxes
     bbox1_area = calculate_bbox_area(bbox1)
     bbox2_area = calculate_bbox_area(bbox2)
-    union_area = bbox1_area + bbox2_area - intersection_area
+    
+    # Use the smaller box area as denominator
+    smaller_area = min(bbox1_area, bbox2_area)
     
     # Avoid division by zero
-    if union_area == 0:
+    if smaller_area == 0:
         return 0.0
     
-    return intersection_area / union_area
+    return intersection_area / smaller_area
 
-def remove_duplicate_detections(detections, iou_threshold=0.3, class_filter=None):
+def calculate_intersection_both_ways(bbox1, bbox2):
+    """
+    Calculate intersection percentage from both perspectives.
+    Returns the maximum percentage (useful for nested boxes).
+    
+    Args:
+        bbox1: List or tuple in format [xmin, ymin, xmax, ymax]
+        bbox2: List or tuple in format [xmin, ymin, xmax, ymax]
+        
+    Returns:
+        tuple: (intersection_pct_bbox1, intersection_pct_bbox2, max_intersection_pct)
+    """
+    x1_min, y1_min, x1_max, y1_max = bbox1
+    x2_min, y2_min, x2_max, y2_max = bbox2
+    
+    # Calculate intersection coordinates
+    inter_xmin = max(x1_min, x2_min)
+    inter_ymin = max(y1_min, y2_min)
+    inter_xmax = min(x1_max, x2_max)
+    inter_ymax = min(y1_max, y2_max)
+    
+    # Check if there's any intersection
+    if inter_xmin >= inter_xmax or inter_ymin >= inter_ymax:
+        return 0.0, 0.0, 0.0
+    
+    # Calculate intersection area
+    intersection_area = (inter_xmax - inter_xmin) * (inter_ymax - inter_ymin)
+    
+    # Calculate areas of both boxes
+    bbox1_area = calculate_bbox_area(bbox1)
+    bbox2_area = calculate_bbox_area(bbox2)
+    
+    # Calculate intersection percentage for each box
+    pct1 = intersection_area / bbox1_area if bbox1_area > 0 else 0.0
+    pct2 = intersection_area / bbox2_area if bbox2_area > 0 else 0.0
+    
+    return pct1, pct2, max(pct1, pct2)
+
+def remove_duplicate_detections(detections, intersection_threshold=0.7, class_filter=None):
     """
     Remove duplicate detections by keeping the detection with the larger bounding box
-    when IoU exceeds the threshold.
+    when intersection percentage exceeds the threshold.
     
     Args:
         detections: List of detection dictionaries with 'class', 'bbox', 'score' keys
-        iou_threshold: float, IoU threshold for considering detections as duplicates (default: 0.3)
+        intersection_threshold: float, intersection threshold for considering detections as duplicates (default: 0.7)
         class_filter: str or None, only process detections of this class (e.g., 'signature')
         
     Returns:
@@ -94,10 +135,10 @@ def remove_duplicate_detections(detections, iou_threshold=0.3, class_filter=None
         
         # Check against all previously kept detections
         for kept_det in filtered_detections:
-            iou = calculate_iou(current_det['bbox'], kept_det['bbox'])
+            intersection_pct = calculate_intersection_percentage(current_det['bbox'], kept_det['bbox'])
             
-            if iou > iou_threshold:
-                # Current detection is a duplicate
+            if intersection_pct > intersection_threshold:
+                # Current detection is a duplicate (significantly overlaps with a kept detection)
                 is_duplicate = True
                 break
         
@@ -110,15 +151,124 @@ def remove_duplicate_detections(detections, iou_threshold=0.3, class_filter=None
     
     return final_detections
 
-def remove_signature_duplicates(detections, iou_threshold=0.3):
+def remove_signature_duplicates(detections, intersection_threshold=0.7):
     """
     Convenience function specifically for removing duplicate signature detections.
     
     Args:
         detections: List of detection dictionaries
-        iou_threshold: float, IoU threshold for considering detections as duplicates
+        intersection_threshold: float, intersection threshold for considering detections as duplicates
         
     Returns:
         List: Detections with duplicate signatures removed
     """
-    return remove_duplicate_detections(detections, iou_threshold, class_filter='signature')
+    return remove_duplicate_detections(detections, intersection_threshold, class_filter='signature')
+
+# Integration example for VisualFeatureDetection class:
+# Add these methods to your VisualFeatureDetection class
+
+def add_to_visual_feature_detection_class():
+    """
+    Add these methods to your VisualFeatureDetection class in detection_feature_process.py
+    """
+    
+    def calculate_bbox_area(self, bbox):
+        """Calculate the area of a bounding box."""
+        xmin, ymin, xmax, ymax = bbox
+        width = max(0, xmax - xmin)
+        height = max(0, ymax - ymin)
+        return width * height
+
+    def calculate_intersection_percentage(self, bbox1, bbox2):
+        """
+        Calculate intersection percentage of the smaller bounding box.
+        This is perfect for detecting when one box is inside another.
+        """
+        x1_min, y1_min, x1_max, y1_max = bbox1
+        x2_min, y2_min, x2_max, y2_max = bbox2
+        
+        # Calculate intersection coordinates
+        inter_xmin = max(x1_min, x2_min)
+        inter_ymin = max(y1_min, y2_min)
+        inter_xmax = min(x1_max, x2_max)
+        inter_ymax = min(y1_max, y2_max)
+        
+        # Check if there's any intersection
+        if inter_xmin >= inter_xmax or inter_ymin >= inter_ymax:
+            return 0.0
+        
+        # Calculate intersection area
+        intersection_area = (inter_xmax - inter_xmin) * (inter_ymax - inter_ymin)
+        
+        # Calculate areas of both boxes
+        bbox1_area = self.calculate_bbox_area(bbox1)
+        bbox2_area = self.calculate_bbox_area(bbox2)
+        
+        # Use the smaller box area as denominator
+        smaller_area = min(bbox1_area, bbox2_area)
+        
+        # Avoid division by zero
+        if smaller_area == 0:
+            return 0.0
+        
+        return intersection_area / smaller_area
+
+    def remove_duplicate_signatures(self, detections, intersection_threshold=0.7):
+        """
+        Remove duplicate signature detections by keeping the larger bounding box.
+        Uses intersection percentage instead of IoU for better nested box detection.
+        
+        Args:
+            detections: List of detection dictionaries
+            intersection_threshold: float, intersection threshold for considering detections as duplicates
+            
+        Returns:
+            List: Detections with duplicate signatures removed
+        """
+        if not detections:
+            return detections
+        
+        # Separate signature detections from others
+        signature_detections = [det for det in detections if det['class'].lower() == 'signature']
+        other_detections = [det for det in detections if det['class'].lower() != 'signature']
+        
+        if len(signature_detections) <= 1:
+            return detections
+        
+        # Sort signature detections by area (largest first)
+        signature_detections_with_area = []
+        for det in signature_detections:
+            area = self.calculate_bbox_area(det['bbox'])
+            signature_detections_with_area.append((det, area))
+        
+        signature_detections_with_area.sort(key=lambda x: x[1], reverse=True)
+        
+        # Keep track of detections to keep
+        filtered_signatures = []
+        
+        for i, (current_det, current_area) in enumerate(signature_detections_with_area):
+            is_duplicate = False
+            
+            # Check against all previously kept detections
+            for kept_det in filtered_signatures:
+                intersection_pct = self.calculate_intersection_percentage(current_det['bbox'], kept_det['bbox'])
+                
+                if intersection_pct > intersection_threshold:
+                    self.logger.info(f"Removing duplicate signature detection with intersection: {intersection_pct:.3f}")
+                    self.logger.info(f"Current bbox: {current_det['bbox']}, Kept bbox: {kept_det['bbox']}")
+                    is_duplicate = True
+                    break
+            
+            # If not a duplicate, keep this detection
+            if not is_duplicate:
+                filtered_signatures.append(current_det)
+        
+        # Log the number of duplicates removed
+        removed_count = len(signature_detections) - len(filtered_signatures)
+        if removed_count > 0:
+            self.logger.info(f"Removed {removed_count} duplicate signature detection(s)")
+        
+        # Combine filtered signatures with other detections
+        final_detections = filtered_signatures + other_detections
+        
+        return final_detections
