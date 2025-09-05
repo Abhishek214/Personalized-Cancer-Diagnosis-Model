@@ -1,0 +1,221 @@
+import os
+import pypdfium2 as pdfium
+from PIL import Image
+import numpy as np
+import argparse
+from pathlib import Path
+import cv2
+
+def pdf_to_images(pdf_path, output_dir=None, dpi=150, image_format='jpg'):
+    """
+    Convert PDF to images
+    
+    Args:
+        pdf_path (str): Path to PDF file
+        output_dir (str): Output directory for images (default: same as PDF)
+        dpi (int): DPI for image quality (default: 150)
+        image_format (str): Output image format ('jpg', 'png', 'tiff')
+    
+    Returns:
+        list: List of saved image paths
+    """
+    
+    # Set up output directory
+    if output_dir is None:
+        output_dir = Path(pdf_path).parent / f"{Path(pdf_path).stem}_images"
+    else:
+        output_dir = Path(output_dir)
+    
+    output_dir.mkdir(exist_ok=True)
+    
+    # Calculate scale from DPI (72 is default PDF DPI)
+    scale = dpi / 72
+    
+    saved_images = []
+    
+    try:
+        # Open PDF
+        pdf_document = pdfium.PdfDocument(pdf_path)
+        print(f"Converting PDF: {pdf_path}")
+        print(f"Total pages: {len(pdf_document)}")
+        print(f"Output directory: {output_dir}")
+        
+        # Convert each page
+        for page_num in range(len(pdf_document)):
+            print(f"Processing page {page_num + 1}/{len(pdf_document)}")
+            
+            # Get page
+            page = pdf_document[page_num]
+            
+            # Render page to bitmap
+            bitmap = page.render(scale=scale, rotation=0)
+            
+            # Convert to PIL Image
+            pil_image = bitmap.to_pil()
+            
+            # Convert to RGB if needed
+            if pil_image.mode != 'RGB':
+                pil_image = pil_image.convert('RGB')
+            
+            # Save image
+            output_filename = f"page_{page_num + 1:03d}.{image_format.lower()}"
+            output_path = output_dir / output_filename
+            
+            pil_image.save(output_path, format=image_format.upper())
+            saved_images.append(str(output_path))
+            
+            print(f"Saved: {output_path}")
+        
+        pdf_document.close()
+        print(f"\nConversion completed! {len(saved_images)} images saved.")
+        
+    except Exception as e:
+        print(f"Error converting PDF: {e}")
+        return []
+    
+    return saved_images
+
+
+def pdf_to_images_opencv(pdf_path, output_dir=None, dpi=150):
+    """
+    Convert PDF to images and return as OpenCV numpy arrays
+    (Similar to your existing extractPDFImage function)
+    """
+    
+    if output_dir:
+        output_dir = Path(output_dir)
+        output_dir.mkdir(exist_ok=True)
+    
+    scale = dpi / 72
+    images_array = []
+    
+    try:
+        pdf_document = pdfium.PdfDocument(pdf_path)
+        
+        for page_num in range(len(pdf_document)):
+            page = pdf_document[page_num]
+            bitmap = page.render(scale=scale, rotation=0)
+            pil_image = bitmap.to_pil()
+            
+            # Convert to numpy array (OpenCV format)
+            image_array = np.array(pil_image.convert("RGB"))
+            images_array.append(image_array)
+            
+            # Optionally save to disk
+            if output_dir:
+                output_path = output_dir / f"page_{page_num + 1:03d}.jpg"
+                cv2.imwrite(str(output_path), cv2.cvtColor(image_array, cv2.COLOR_RGB2BGR))
+        
+        pdf_document.close()
+        
+    except Exception as e:
+        print(f"Error: {e}")
+        return []
+    
+    return images_array
+
+
+def batch_convert_pdfs(input_dir, output_dir=None, dpi=150, image_format='jpg'):
+    """
+    Convert multiple PDFs in a directory to images
+    
+    Args:
+        input_dir (str): Directory containing PDF files
+        output_dir (str): Base output directory
+        dpi (int): DPI for image quality
+        image_format (str): Output image format
+    """
+    
+    input_path = Path(input_dir)
+    if output_dir:
+        output_path = Path(output_dir)
+        output_path.mkdir(exist_ok=True)
+    else:
+        output_path = input_path
+    
+    pdf_files = list(input_path.glob("*.pdf"))
+    
+    if not pdf_files:
+        print(f"No PDF files found in {input_dir}")
+        return
+    
+    print(f"Found {len(pdf_files)} PDF files")
+    
+    for i, pdf_file in enumerate(pdf_files, 1):
+        print(f"\n[{i}/{len(pdf_files)}] Converting: {pdf_file.name}")
+        
+        # Create output directory for this PDF
+        pdf_output_dir = output_path / f"{pdf_file.stem}_images"
+        
+        try:
+            saved_images = pdf_to_images(
+                pdf_path=str(pdf_file),
+                output_dir=str(pdf_output_dir),
+                dpi=dpi,
+                image_format=image_format
+            )
+            print(f"✓ Converted {len(saved_images)} pages")
+            
+        except Exception as e:
+            print(f"✗ Failed to convert {pdf_file.name}: {e}")
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Convert PDF files to images")
+    parser.add_argument("input", help="PDF file or directory containing PDFs")
+    parser.add_argument("-o", "--output", help="Output directory")
+    parser.add_argument("--dpi", type=int, default=150, help="DPI for image quality (default: 150)")
+    parser.add_argument("--format", choices=['jpg', 'png', 'tiff'], default='jpg', help="Output image format")
+    parser.add_argument("--batch", action='store_true', help="Batch convert all PDFs in directory")
+    
+    args = parser.parse_args()
+    
+    input_path = Path(args.input)
+    
+    if not input_path.exists():
+        print(f"Error: {args.input} does not exist")
+        return
+    
+    if args.batch or input_path.is_dir():
+        # Batch convert directory
+        batch_convert_pdfs(
+            input_dir=str(input_path),
+            output_dir=args.output,
+            dpi=args.dpi,
+            image_format=args.format
+        )
+    else:
+        # Convert single PDF
+        if input_path.suffix.lower() != '.pdf':
+            print(f"Error: {args.input} is not a PDF file")
+            return
+        
+        saved_images = pdf_to_images(
+            pdf_path=str(input_path),
+            output_dir=args.output,
+            dpi=args.dpi,
+            image_format=args.format
+        )
+        
+        if saved_images:
+            print(f"\n✓ Successfully converted {len(saved_images)} pages")
+        else:
+            print("\n✗ Conversion failed")
+
+
+# Simple usage examples
+if __name__ == "__main__":
+    # Example 1: Convert single PDF
+    # saved_images = pdf_to_images("document.pdf")
+    
+    # Example 2: Convert with custom settings
+    # saved_images = pdf_to_images("document.pdf", output_dir="./images", dpi=300, image_format="png")
+    
+    # Example 3: Get images as numpy arrays (for your existing pipeline)
+    # image_arrays = pdf_to_images_opencv("document.pdf")
+    
+    # Example 4: Batch convert all PDFs in directory
+    # batch_convert_pdfs("./pdf_folder", "./output_images")
+    
+    # Run command line interface
+    main()
