@@ -1,0 +1,523 @@
+import os
+import cv2
+import numpy as np
+import random
+import json
+import xml.etree.ElementTree as ET
+from PIL import Image, ImageEnhance, ImageFilter
+import albumentations as A
+from typing import List, Tuple, Dict, Union
+import argparse
+from pathlib import Path
+import math
+
+class ChopAugmentationSystem:
+    def __init__(self, 
+                 chop_images_dir: str,
+                 document_images_dir: str,
+                 output_dir: str,
+                 annotation_format: str = "yolo"):
+        """
+        Initialize the Chop Augmentation System
+        
+        Args:
+            chop_images_dir: Directory containing chop/stamp images
+            document_images_dir: Directory containing document images
+            output_dir: Directory to save augmented images and annotations
+            annotation_format: Format for annotations ("yolo", "pascal_voc", "coco")
+        """
+        self.chop_images_dir = Path(chop_images_dir)
+        self.document_images_dir = Path(document_images_dir)
+        self.output_dir = Path(output_dir)
+        self.annotation_format = annotation_format
+        
+        # Create output directories
+        self.output_images_dir = self.output_dir / "images"
+        self.output_annotations_dir = self.output_dir / "annotations"
+        self.output_images_dir.mkdir(parents=True, exist_ok=True)
+        self.output_annotations_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Load chop and document images
+        self.chop_images = self._load_images(self.chop_images_dir)
+        self.document_images = self._load_images(self.document_images_dir)
+        
+        # Class mapping (based on your existing classes)
+        self.class_mapping = {
+            'Signature': 0,
+            'Barcode': 1, 
+            'Chop': 2,
+            'Qrcode': 3
+        }
+        
+        print(f"Loaded {len(self.chop_images)} chop images")
+        print(f"Loaded {len(self.document_images)} document images")
+
+    def _load_images(self, directory: Path) -> List[str]:
+        """Load all image files from directory"""
+        image_extensions = {'.jpg', '.jpeg', '.png', '.bmp', '.tiff', '.tif'}
+        return [str(f) for f in directory.glob('*') if f.suffix.lower() in image_extensions]
+
+    def _apply_chop_transformations(self, chop_image: np.ndarray) -> np.ndarray:
+        """Apply realistic transformations to chop images"""
+        
+        # Define augmentation pipeline
+        transform = A.Compose([
+            A.Rotate(limit=360, p=0.8, border_mode=cv2.BORDER_CONSTANT, value=255),
+            A.RandomScale(scale_limit=0.3, p=0.7),
+            A.GaussianBlur(blur_limit=(1, 3), p=0.3),
+            A.RandomBrightnessContrast(brightness_limit=0.2, contrast_limit=0.2, p=0.5),
+            A.HueSaturationValue(hue_shift_limit=10, sat_shift_limit=15, val_shift_limit=10, p=0.3),
+            A.GaussNoise(var_limit=(10, 50), p=0.2),
+        ])
+        
+        transformed = transform(image=chop_image)
+        return transformed['image']
+
+    def _make_chop_transparent(self, chop_image: np.ndarray, background_color: Tuple[int, int, int] = (255, 255, 255)) -> np.ndarray:
+        """Make chop background transparent and add alpha blending"""
+        
+        # Convert to RGBA if not already
+        if chop_image.shape[2] == 3:
+            chop_image = cv2.cvtColor(chop_image, cv2.COLOR_BGR2BGRA)
+        
+        # Create mask for background (white/light areas)
+        gray = cv2.cvtColor(chop_image[:,:,:3], cv2.COLOR_BGR2GRAY)
+        _, mask = cv2.threshold(gray, 240, 255, cv2.THRESH_BINARY)
+        
+        # Set alpha channel
+        chop_image[:,:,3] = 255 - mask
+        
+        # Add some transparency for realistic blending
+        alpha_factor = random.uniform(0.7, 0.95)
+        chop_image[:,:,3] = (chop_image[:,:,3] * alpha_factor).astype(np.uint8)
+        
+        return chop_image
+
+    def _find_safe_placement_areas(self, document: np.ndarray, existing_objects: List[Dict] = None) -> List[Tuple[int, int, int, int]]:
+        """Find areas in document where chops can be safely placed"""
+        
+        height, width = document.shape[:2]
+        
+        # Convert to grayscale for text detection
+        gray = cv2.cvtColor(document, cv2.COLOR_BGR2GRAY)
+        
+        # Detect text areas using edge detection and morphology
+        edges = cv2.Canny(gray, 50, 150)
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+        dilated = cv2.dilate(edges, kernel, iterations=2)
+        
+        # Find contours (potential text/object areas)
+        contours, _ = cv2.findContours(dilated, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        
+        # Create mask of occupied areas
+        occupied_mask = np.zeros_like(gray)
+        for contour in contours:
+            cv2.fillPoly(occupied_mask, [contour], 255)
+        
+        # Add existing objects to occupied mask
+        if existing_objects:
+            for obj in existing_objects:
+                x1, y1, x2, y2 = obj['bbox']
+                cv2.rectangle(occupied_mask, (x1, y1), (x2, y2), 255, -1)
+        
+        # Find free areas by inverting the mask
+        free_mask = cv2.bitwise_not(occupied_mask)
+        
+        # Define potential placement areas (avoiding document edges)
+        margin = 50
+        safe_areas = []
+        
+        # Define grid for systematic placement
+        grid_size = 100
+        for y in range(margin, height - margin, grid_size):
+            for x in range(margin, width - margin, grid_size):
+                # Check if area is mostly free
+                roi = free_mask[y:y+grid_size, x:x+grid_size]
+                if np.sum(roi) > (grid_size * grid_size * 0.7):  # 70% free
+                    safe_areas.append((x, y, x+grid_size, y+grid_size))
+        
+        return safe_areas
+
+    def _place_chop_on_document(self, 
+                                document: np.ndarray, 
+                                chop: np.ndarray, 
+                                position: Tuple[int, int],
+                                scale_factor: float = 1.0) -> Tuple[np.ndarray, Dict]:
+        """Place a chop on document at specified position"""
+        
+        # Resize chop
+        chop_height, chop_width = chop.shape[:2]
+        new_height = int(chop_height * scale_factor)
+        new_width = int(chop_width * scale_factor)
+        chop_resized = cv2.resize(chop, (new_width, new_height))
+        
+        # Apply transformations
+        chop_transformed = self._apply_chop_transformations(chop_resized)
+        chop_with_alpha = self._make_chop_transparent(chop_transformed)
+        
+        # Get placement coordinates
+        x, y = position
+        doc_height, doc_width = document.shape[:2]
+        
+        # Ensure chop fits within document bounds
+        x = max(0, min(x, doc_width - new_width))
+        y = max(0, min(y, doc_height - new_height))
+        
+        # Convert document to RGBA for blending
+        if document.shape[2] == 3:
+            document_rgba = cv2.cvtColor(document, cv2.COLOR_BGR2BGRA)
+        else:
+            document_rgba = document.copy()
+        
+        # Extract the region where chop will be placed
+        roi = document_rgba[y:y+new_height, x:x+new_width]
+        
+        # Blend chop with document
+        alpha = chop_with_alpha[:,:,3:4] / 255.0
+        chop_rgb = chop_with_alpha[:,:,:3]
+        
+        # Ensure dimensions match
+        min_h = min(roi.shape[0], chop_rgb.shape[0], alpha.shape[0])
+        min_w = min(roi.shape[1], chop_rgb.shape[1], alpha.shape[1])
+        
+        blended = roi[:min_h, :min_w, :3] * (1 - alpha[:min_h, :min_w]) + chop_rgb[:min_h, :min_w] * alpha[:min_h, :min_w]
+        document_rgba[y:y+min_h, x:x+min_w, :3] = blended.astype(np.uint8)
+        
+        # Convert back to BGR
+        result_document = cv2.cvtColor(document_rgba, cv2.COLOR_BGRA2BGR)
+        
+        # Create annotation
+        annotation = {
+            'class': 'Chop',
+            'class_id': self.class_mapping['Chop'],
+            'bbox': [x, y, x + min_w, y + min_h],
+            'confidence': 1.0
+        }
+        
+        return result_document, annotation
+
+    def _generate_yolo_annotation(self, annotations: List[Dict], image_width: int, image_height: int) -> str:
+        """Generate YOLO format annotation string"""
+        yolo_lines = []
+        
+        for ann in annotations:
+            class_id = ann['class_id']
+            x1, y1, x2, y2 = ann['bbox']
+            
+            # Convert to YOLO format (normalized center coordinates and dimensions)
+            center_x = (x1 + x2) / 2 / image_width
+            center_y = (y1 + y2) / 2 / image_height
+            width = (x2 - x1) / image_width
+            height = (y2 - y1) / image_height
+            
+            yolo_lines.append(f"{class_id} {center_x:.6f} {center_y:.6f} {width:.6f} {height:.6f}")
+        
+        return '\n'.join(yolo_lines)
+
+    def _generate_pascal_voc_annotation(self, annotations: List[Dict], image_path: str, image_width: int, image_height: int) -> str:
+        """Generate Pascal VOC format XML annotation"""
+        
+        annotation = ET.Element("annotation")
+        
+        # Add basic image info
+        folder = ET.SubElement(annotation, "folder")
+        folder.text = "images"
+        
+        filename = ET.SubElement(annotation, "filename")
+        filename.text = os.path.basename(image_path)
+        
+        size = ET.SubElement(annotation, "size")
+        width_elem = ET.SubElement(size, "width")
+        width_elem.text = str(image_width)
+        height_elem = ET.SubElement(size, "height")
+        height_elem.text = str(image_height)
+        depth_elem = ET.SubElement(size, "depth")
+        depth_elem.text = "3"
+        
+        # Add objects
+        for ann in annotations:
+            obj = ET.SubElement(annotation, "object")
+            
+            name = ET.SubElement(obj, "name")
+            name.text = ann['class']
+            
+            difficult = ET.SubElement(obj, "difficult")
+            difficult.text = "0"
+            
+            bndbox = ET.SubElement(obj, "bndbox")
+            xmin = ET.SubElement(bndbox, "xmin")
+            xmin.text = str(int(ann['bbox'][0]))
+            ymin = ET.SubElement(bndbox, "ymin")
+            ymin.text = str(int(ann['bbox'][1]))
+            xmax = ET.SubElement(bndbox, "xmax")
+            xmax.text = str(int(ann['bbox'][2]))
+            ymax = ET.SubElement(bndbox, "ymax")
+            ymax.text = str(int(ann['bbox'][3]))
+        
+        return ET.tostring(annotation, encoding='unicode')
+
+    def _generate_coco_annotation(self, annotations: List[Dict], image_id: int, image_path: str, image_width: int, image_height: int) -> Dict:
+        """Generate COCO format annotation"""
+        
+        coco_annotations = []
+        
+        for i, ann in enumerate(annotations):
+            x1, y1, x2, y2 = ann['bbox']
+            width = x2 - x1
+            height = y2 - y1
+            area = width * height
+            
+            coco_ann = {
+                "id": image_id * 1000 + i,
+                "image_id": image_id,
+                "category_id": ann['class_id'],
+                "bbox": [x1, y1, width, height],
+                "area": area,
+                "iscrowd": 0
+            }
+            coco_annotations.append(coco_ann)
+        
+        return coco_annotations
+
+    def augment_single_document(self, 
+                               document_path: str, 
+                               num_chops: int = None,
+                               output_prefix: str = None) -> List[str]:
+        """Augment a single document with randomly placed chops"""
+        
+        # Load document
+        document = cv2.imread(document_path)
+        if document is None:
+            raise ValueError(f"Could not load document: {document_path}")
+        
+        doc_height, doc_width = document.shape[:2]
+        
+        # Determine number of chops to place
+        if num_chops is None:
+            num_chops = random.randint(1, 4)  # 1-4 chops per document
+        
+        # Find safe placement areas
+        safe_areas = self._find_safe_placement_areas(document)
+        
+        if len(safe_areas) < num_chops:
+            num_chops = len(safe_areas)
+        
+        # Select random safe areas
+        selected_areas = random.sample(safe_areas, num_chops)
+        
+        annotations = []
+        result_document = document.copy()
+        
+        # Place chops
+        for i in range(num_chops):
+            # Select random chop
+            chop_path = random.choice(self.chop_images)
+            chop = cv2.imread(chop_path)
+            
+            if chop is None:
+                continue
+            
+            # Random scale factor
+            scale_factor = random.uniform(0.3, 1.2)
+            
+            # Random position within selected safe area
+            x1, y1, x2, y2 = selected_areas[i]
+            pos_x = random.randint(x1, max(x1, x2 - int(chop.shape[1] * scale_factor)))
+            pos_y = random.randint(y1, max(y1, y2 - int(chop.shape[0] * scale_factor)))
+            
+            # Place chop
+            result_document, annotation = self._place_chop_on_document(
+                result_document, chop, (pos_x, pos_y), scale_factor
+            )
+            annotations.append(annotation)
+        
+        # Generate output filename
+        base_name = Path(document_path).stem
+        if output_prefix:
+            output_name = f"{output_prefix}_{base_name}_aug_{random.randint(1000, 9999)}"
+        else:
+            output_name = f"{base_name}_aug_{random.randint(1000, 9999)}"
+        
+        # Save augmented image
+        output_image_path = self.output_images_dir / f"{output_name}.jpg"
+        cv2.imwrite(str(output_image_path), result_document)
+        
+        # Save annotations
+        if self.annotation_format == "yolo":
+            annotation_content = self._generate_yolo_annotation(annotations, doc_width, doc_height)
+            annotation_path = self.output_annotations_dir / f"{output_name}.txt"
+            with open(annotation_path, 'w') as f:
+                f.write(annotation_content)
+        
+        elif self.annotation_format == "pascal_voc":
+            annotation_content = self._generate_pascal_voc_annotation(
+                annotations, str(output_image_path), doc_width, doc_height
+            )
+            annotation_path = self.output_annotations_dir / f"{output_name}.xml"
+            with open(annotation_path, 'w') as f:
+                f.write(annotation_content)
+        
+        elif self.annotation_format == "coco":
+            # COCO format will be handled separately in batch processing
+            pass
+        
+        return [str(output_image_path), str(annotation_path)]
+
+    def batch_augment(self, 
+                     num_augmentations_per_document: int = 5,
+                     max_chops_per_document: int = 3) -> Dict:
+        """Perform batch augmentation on all documents"""
+        
+        results = {
+            'total_generated': 0,
+            'generated_files': [],
+            'errors': []
+        }
+        
+        coco_data = {
+            "images": [],
+            "annotations": [],
+            "categories": [
+                {"id": 0, "name": "Signature"},
+                {"id": 1, "name": "Barcode"},
+                {"id": 2, "name": "Chop"},
+                {"id": 3, "name": "Qrcode"}
+            ]
+        }
+        
+        image_id = 1
+        
+        for doc_path in self.document_images:
+            try:
+                for aug_idx in range(num_augmentations_per_document):
+                    num_chops = random.randint(1, max_chops_per_document)
+                    
+                    generated_files = self.augment_single_document(
+                        doc_path, 
+                        num_chops=num_chops,
+                        output_prefix=f"batch_{aug_idx}"
+                    )
+                    
+                    results['generated_files'].extend(generated_files)
+                    results['total_generated'] += 1
+                    
+                    # Add to COCO format if needed
+                    if self.annotation_format == "coco":
+                        # Load the generated image to get dimensions
+                        img_path = generated_files[0]
+                        img = cv2.imread(img_path)
+                        height, width = img.shape[:2]
+                        
+                        coco_data["images"].append({
+                            "id": image_id,
+                            "file_name": os.path.basename(img_path),
+                            "width": width,
+                            "height": height
+                        })
+                        
+                        image_id += 1
+                    
+                    print(f"Generated augmentation {aug_idx + 1}/{num_augmentations_per_document} for {Path(doc_path).name}")
+                
+            except Exception as e:
+                error_msg = f"Error processing {doc_path}: {str(e)}"
+                results['errors'].append(error_msg)
+                print(error_msg)
+        
+        # Save COCO format if selected
+        if self.annotation_format == "coco" and coco_data["images"]:
+            coco_path = self.output_annotations_dir / "annotations.json"
+            with open(coco_path, 'w') as f:
+                json.dump(coco_data, f, indent=2)
+            results['generated_files'].append(str(coco_path))
+        
+        return results
+
+    def create_training_splits(self, train_ratio: float = 0.8, val_ratio: float = 0.15):
+        """Create train/validation/test splits for generated data"""
+        
+        # Get all generated images
+        image_files = list(self.output_images_dir.glob("*.jpg"))
+        random.shuffle(image_files)
+        
+        total_files = len(image_files)
+        train_count = int(total_files * train_ratio)
+        val_count = int(total_files * val_ratio)
+        
+        train_files = image_files[:train_count]
+        val_files = image_files[train_count:train_count + val_count]
+        test_files = image_files[train_count + val_count:]
+        
+        # Create split directories
+        for split_name, files in [("train", train_files), ("val", val_files), ("test", test_files)]:
+            split_dir = self.output_dir / split_name
+            split_images_dir = split_dir / "images"
+            split_annotations_dir = split_dir / "annotations"
+            
+            split_images_dir.mkdir(parents=True, exist_ok=True)
+            split_annotations_dir.mkdir(parents=True, exist_ok=True)
+            
+            # Copy files to split directories
+            for img_file in files:
+                # Copy image
+                cv2.imwrite(str(split_images_dir / img_file.name), cv2.imread(str(img_file)))
+                
+                # Copy annotation
+                if self.annotation_format == "yolo":
+                    ann_file = self.output_annotations_dir / f"{img_file.stem}.txt"
+                elif self.annotation_format == "pascal_voc":
+                    ann_file = self.output_annotations_dir / f"{img_file.stem}.xml"
+                
+                if ann_file.exists():
+                    with open(ann_file, 'r') as src, open(split_annotations_dir / ann_file.name, 'w') as dst:
+                        dst.write(src.read())
+        
+        print(f"Created splits: Train={len(train_files)}, Val={len(val_files)}, Test={len(test_files)}")
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Chop Data Augmentation System")
+    parser.add_argument("--chop_images_dir", required=True, help="Directory containing chop images")
+    parser.add_argument("--document_images_dir", required=True, help="Directory containing document images")
+    parser.add_argument("--output_dir", required=True, help="Output directory for augmented data")
+    parser.add_argument("--annotation_format", choices=["yolo", "pascal_voc", "coco"], default="yolo", help="Annotation format")
+    parser.add_argument("--num_augmentations", type=int, default=5, help="Number of augmentations per document")
+    parser.add_argument("--max_chops", type=int, default=3, help="Maximum chops per document")
+    parser.add_argument("--create_splits", action="store_true", help="Create train/val/test splits")
+    
+    args = parser.parse_args()
+    
+    # Initialize augmentation system
+    augmenter = ChopAugmentationSystem(
+        chop_images_dir=args.chop_images_dir,
+        document_images_dir=args.document_images_dir,
+        output_dir=args.output_dir,
+        annotation_format=args.annotation_format
+    )
+    
+    # Perform batch augmentation
+    print("Starting batch augmentation...")
+    results = augmenter.batch_augment(
+        num_augmentations_per_document=args.num_augmentations,
+        max_chops_per_document=args.max_chops
+    )
+    
+    print(f"\nAugmentation completed!")
+    print(f"Total generated: {results['total_generated']}")
+    print(f"Errors: {len(results['errors'])}")
+    
+    if results['errors']:
+        print("Errors encountered:")
+        for error in results['errors']:
+            print(f"  - {error}")
+    
+    # Create training splits if requested
+    if args.create_splits:
+        print("\nCreating training splits...")
+        augmenter.create_training_splits()
+    
+    print(f"\nOutput saved to: {args.output_dir}")
+
+
+if __name__ == "__main__":
+    main()
