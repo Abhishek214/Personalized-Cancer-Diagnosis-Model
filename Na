@@ -1,0 +1,150 @@
+import numpy as np
+import random
+import os
+from PIL import Image
+from pathlib import Path
+import albumentations as A
+
+def apply_chop_transformations(chop_image):
+    """Apply realistic transformations to chop images"""
+    transform = A.Compose([
+        A.Rotate(limit=15, p=0.8, border_mode=cv2.BORDER_CONSTANT, value=255),  # Limited to 0-15 degrees
+        A.VerticalFlip(p=0.5),  # Added vertical flip
+        A.RandomScale(scale_limit=0.3, p=0.7),
+        A.GaussianBlur(blur_limit=(1, 3), p=0.3),
+        A.RandomBrightnessContrast(brightness_limit=0.2, contrast_limit=0.2, p=0.5),
+        A.GaussNoise(var_limit=(10, 50), p=0.2),
+    ])
+    return transform(image=chop_image)['image']
+
+# Remove the make_chop_transparent function entirely - no longer needed
+
+def find_safe_areas(document):
+    """Find areas where chops can be placed - improved version"""
+    height, width = document.shape[:2]
+    gray = cv2.cvtColor(document, cv2.COLOR_BGR2GRAY)
+    
+    # Use adaptive thresholding to better detect text and content
+    binary = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 11, 2)
+    
+    # Invert so text/content areas are white
+    binary = cv2.bitwise_not(binary)
+    
+    # More aggressive morphological operations to expand text/content areas
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (15, 15))  # Larger kernel
+    occupied_mask = cv2.dilate(binary, kernel, iterations=3)  # More iterations
+    
+    # Create free mask (areas without text/content)
+    free_mask = cv2.bitwise_not(occupied_mask)
+    
+    # Further erode free areas to ensure we're well away from content
+    erode_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (20, 20))
+    free_mask = cv2.erode(free_mask, erode_kernel, iterations=2)
+    
+    margin = 100  # Increased margin from edges
+    safe_areas = []
+    grid_size = 150  # Larger grid size for better placement
+    
+    for y in range(margin, height - margin, grid_size):
+        for x in range(margin, width - margin, grid_size):
+            # Check a larger region around each grid point
+            roi = free_mask[y:y+grid_size, x:x+grid_size]
+            if roi.size > 0:
+                # Require a higher percentage of the region to be free
+                if np.sum(roi) / (roi.size * 255) > 0.8:  # 80% of area must be free
+                    safe_areas.append((x, y, x+grid_size, y+grid_size))
+    
+    return safe_areas
+
+def place_chop_on_document(document, chop, position, scale_factor=1.0):
+    """Place chop on document without transparency"""
+    # Resize chop
+    chop_height, chop_width = chop.shape[:2]
+    new_height = int(chop_height * scale_factor)
+    new_width = int(chop_width * scale_factor)
+    chop_resized = cv2.resize(chop, (new_width, new_height))
+    
+    # Apply transformations
+    chop_transformed = apply_chop_transformations(chop_resized)
+    
+    # NO transparency processing - use chop as is
+    
+    # Get placement coordinates
+    x, y = position
+    doc_height, doc_width = document.shape[:2]
+    
+    # Ensure chop fits within document bounds
+    x = max(0, min(x, doc_width - new_width))
+    y = max(0, min(y, doc_height - new_height))
+    
+    # Convert document to RGBA if it's not already
+    if document.shape[2] == 3:
+        document_rgba = cv2.cvtColor(document, cv2.COLOR_BGR2BGRA)
+    else:
+        document_rgba = document.copy()
+    
+    # Simply place the chop directly on the document (no blending)
+    chop_final = chop_transformed
+    if chop_final.shape[2] == 3:
+        chop_final = cv2.cvtColor(chop_final, cv2.COLOR_BGR2BGRA)
+    
+    # Direct placement without alpha blending
+    document_rgba[y:y+new_height, x:x+new_width] = chop_final
+    
+    return cv2.cvtColor(document_rgba, cv2.COLOR_BGRA2BGR)
+
+def augment_images(chop_images_dir, document_images_dir, output_dir, num_chops_per_doc=3):
+    """Main function to augment images"""
+    chop_dir = Path(chop_images_dir)
+    doc_dir = Path(document_images_dir)
+    output_path = Path(output_dir)
+    output_path.mkdir(exist_ok=True)
+    
+    # Load image paths
+    chop_images = list(chop_dir.glob("*.jpg")) + list(chop_dir.glob("*.png"))
+    doc_images = list(doc_dir.glob("*.jpg")) + list(doc_dir.glob("*.png"))
+    
+    for doc_path in doc_images:
+        document = cv2.imread(str(doc_path))
+        if document is None:
+            continue
+            
+        safe_areas = find_safe_areas(document)
+        num_chops = min(num_chops_per_doc, len(safe_areas))
+        
+        if num_chops == 0:
+            continue
+            
+        selected_areas = random.sample(safe_areas, num_chops)
+        result_document = document.copy()
+        
+        for i in range(num_chops):
+            chop_path = random.choice(chop_images)
+            chop = cv2.imread(str(chop_path))
+            
+            if chop is None:
+                continue
+                
+            scale_factor = random.uniform(0.3, 1.2)
+            x1, y1, x2, y2 = selected_areas[i]
+            pos_x = random.randint(x1, max(x1, x2 - int(chop.shape[1] * scale_factor)))
+            pos_y = random.randint(y1, max(y1, y2 - int(chop.shape[0] * scale_factor)))
+            
+            result_document = place_chop_on_document(
+                result_document, chop, (pos_x, pos_y), scale_factor
+            )
+        
+        # Save result
+        output_name = f"{doc_path.stem}_with_chops_{random.randint(1000, 9999)}.jpg"
+        output_file = output_path / output_name
+        cv2.imwrite(str(output_file), result_document)
+        print(f"Saved: {output_file}")
+
+# Usage
+if __name__ == "__main__":
+    augment_images(
+        chop_images_dir="./chop_images",
+        document_images_dir="./document_images", 
+        output_dir="./output",
+        num_chops_per_doc=3
+    )
