@@ -1,0 +1,17 @@
+    result = transform(image=chop_image)['image']
+    
+    # Convert black padding to white while preserving content
+    # Find edges to identify padding vs content
+    gray = cv2.cvtColor(result, cv2.COLOR_RGB2GRAY)
+    edges = cv2.Canny(gray, 50, 150)
+    
+    # Dilate edges to create content mask
+    kernel = np.ones((5,5), np.uint8)
+    content_mask = cv2.dilate(edges, kernel, iterations=2)
+    
+    # Make black areas white only where there's no content
+    black_mask = np.all(result == [0, 0, 0], axis=2)
+    padding_mask = black_mask & (content_mask == 0)
+    result[padding_mask] = [255, 255, 255]
+    
+    return result
