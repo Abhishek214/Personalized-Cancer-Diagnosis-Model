@@ -1,0 +1,122 @@
+from PIL import Image, ImageEnhance, ImageFilter, ImageChops
+import numpy as np
+from typing import Tuple, Optional
+
+class ChopOverlay:
+    def __init__(self, chop_image_path: str):
+        """Initialize with path to chop image"""
+        self.chop_image = Image.open(chop_image_path).convert("RGBA")
+        
+    def remove_background(self, threshold: int = 200) -> Image.Image:
+        """Remove white/light background from chop image"""
+        img = self.chop_image.copy()
+        data = np.array(img)
+        
+        # Create mask for light pixels (background)
+        light_mask = np.all(data[:, :, :3] > threshold, axis=2)
+        
+        # Set alpha to 0 for light pixels
+        data[light_mask, 3] = 0
+        
+        return Image.fromarray(data, 'RGBA')
+    
+    def match_background_color(self, document: Image.Image, position: Tuple[int, int], 
+                             sample_radius: int = 20) -> Image.Image:
+        """Match chop background to document background color at position"""
+        chop = self.remove_background()
+        
+        # Sample background color from document
+        x, y = position
+        crop_area = (max(0, x-sample_radius), max(0, y-sample_radius),
+                    min(document.width, x+sample_radius), 
+                    min(document.height, y+sample_radius))
+        
+        sample_area = document.crop(crop_area)
+        avg_color = tuple(np.mean(np.array(sample_area), axis=(0,1)).astype(int))
+        
+        # Create background layer with sampled color
+        bg_layer = Image.new('RGBA', chop.size, avg_color + (255,))
+        
+        # Composite chop over background
+        return Image.alpha_composite(bg_layer, chop)
+    
+    def blend_with_document(self, document_path: str, position: Tuple[int, int],
+                          opacity: float = 0.8, size: Optional[Tuple[int, int]] = None,
+                          output_path: str = "output_document.png") -> Image.Image:
+        """Blend chop with document at specified position"""
+        
+        # Load document
+        document = Image.open(document_path).convert("RGBA")
+        
+        # Resize chop if specified
+        chop = self.chop_image.copy()
+        if size:
+            chop = chop.resize(size, Image.Resampling.LANCZOS)
+        
+        # Remove background and match document background
+        chop_processed = self.match_background_color(document, position)
+        
+        # Adjust opacity
+        if opacity < 1.0:
+            enhancer = ImageEnhance.Brightness(chop_processed)
+            chop_processed = enhancer.enhance(opacity)
+        
+        # Create overlay
+        overlay = Image.new('RGBA', document.size, (0, 0, 0, 0))
+        overlay.paste(chop_processed, position, chop_processed)
+        
+        # Composite with document
+        result = Image.alpha_composite(document, overlay)
+        
+        # Save result
+        result.save(output_path, "PNG")
+        return result
+    
+    def auto_position_chop(self, document_path: str, corner: str = "bottom_right",
+                          margin: int = 50, **kwargs) -> Image.Image:
+        """Automatically position chop in document corner"""
+        
+        document = Image.open(document_path).convert("RGBA")
+        chop_size = kwargs.get('size', self.chop_image.size)
+        
+        # Calculate position based on corner
+        positions = {
+            'top_left': (margin, margin),
+            'top_right': (document.width - chop_size[0] - margin, margin),
+            'bottom_left': (margin, document.height - chop_size[1] - margin),
+            'bottom_right': (document.width - chop_size[0] - margin, 
+                           document.height - chop_size[1] - margin)
+        }
+        
+        position = positions.get(corner, positions['bottom_right'])
+        
+        return self.blend_with_document(document_path, position, **kwargs)
+
+# Usage examples
+def main():
+    # Initialize with your chop image
+    chop_tool = ChopOverlay("chop_image.png")
+    
+    # Method 1: Manual positioning
+    result1 = chop_tool.blend_with_document(
+        document_path="document.pdf",  # or .png, .jpg
+        position=(500, 700),  # x, y coordinates
+        opacity=0.7,
+        size=(200, 100),  # resize chop
+        output_path="stamped_document.png"
+    )
+    
+    # Method 2: Auto-position in corner
+    result2 = chop_tool.auto_position_chop(
+        document_path="document.pdf",
+        corner="bottom_right",  # top_left, top_right, bottom_left, bottom_right
+        margin=30,
+        opacity=0.8,
+        size=(150, 75),
+        output_path="auto_stamped_document.png"
+    )
+    
+    print("Chop overlay completed!")
+
+if __name__ == "__main__":
+    main()
