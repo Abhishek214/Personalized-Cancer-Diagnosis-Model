@@ -1,0 +1,22 @@
+import os
+import zipfile
+
+def extract_all_zips(folder_path, extract_to=None):
+    if extract_to is None:
+        extract_to = folder_path  # Extract in same folder if not given
+
+    for root, _, files in os.walk(folder_path):
+        for file in files:
+            if file.lower().endswith(".zip"):
+                zip_path = os.path.join(root, file)
+                extract_path = os.path.join(extract_to, os.path.splitext(file)[0])
+
+                os.makedirs(extract_path, exist_ok=True)
+
+                with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+                    zip_ref.extractall(extract_path)
+
+                print(f"Extracted: {zip_path} → {extract_path}")
+
+# Example usage
+extract_all_zips("path/to/your/folder")
