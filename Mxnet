@@ -1,0 +1,219 @@
+def calculate_detection_metrics(gt_boxes, gt_classes, pred_boxes, pred_classes, pred_scores,
+                               iou_threshold=0.5, score_threshold=0.3):
+    """
+    Calculate TP, FP, FN for object detection metrics
+    """
+    tp_per_class = {}
+    fp_per_class = {}
+    fn_per_class = {}
+    
+    # Initialize counters for all classes
+    all_classes = set(gt_classes + pred_classes)
+    for class_id in all_classes:
+        tp_per_class[class_id] = 0
+        fp_per_class[class_id] = 0
+        fn_per_class[class_id] = 0
+    
+    # Filter predictions by score threshold
+    valid_preds = [(i, box, cls, score) for i, (box, cls, score) in 
+                   enumerate(zip(pred_boxes, pred_classes, pred_scores)) 
+                   if score >= score_threshold]
+    
+    # Track which ground truth boxes have been matched
+    matched_gt = [False] * len(gt_boxes)
+    
+    # For each prediction, find best matching ground truth
+    for pred_idx, pred_box, pred_class, pred_score in valid_preds:
+        best_iou = 0
+        best_gt_idx = -1
+        
+        # Find best matching ground truth box of same class
+        for gt_idx, (gt_box, gt_class) in enumerate(zip(gt_boxes, gt_classes)):
+            if pred_class == gt_class and not matched_gt[gt_idx]:
+                iou = calculate_iou(pred_box, gt_box)
+                if iou > best_iou:
+                    best_iou = iou
+                    best_gt_idx = gt_idx
+        
+        # Determine if this prediction is TP or FP
+        if best_iou >= iou_threshold and best_gt_idx != -1:
+            # True Positive
+            tp_per_class[pred_class] += 1
+            matched_gt[best_gt_idx] = True
+        else:
+            # False Positive
+            fp_per_class[pred_class] += 1
+    
+    # Count False Negatives (unmatched ground truth boxes)
+    for gt_idx, (gt_box, gt_class) in enumerate(zip(gt_boxes, gt_classes)):
+        if not matched_gt[gt_idx]:
+            fn_per_class[gt_class] += 1
+    
+    return tp_per_class, fp_per_class, fn_per_class
+
+def calculate_f1_scores(tp_per_class, fp_per_class, fn_per_class):
+    """
+    Calculate precision, recall, and F1 score per class
+    """
+    metrics = {}
+    
+    for class_id in tp_per_class.keys():
+        tp = tp_per_class[class_id]
+        fp = fp_per_class[class_id]
+        fn = fn_per_class[class_id]
+        
+        # Calculate precision and recall
+        precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+        recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+        
+        # Calculate F1 score
+        f1 = 2 * (precision * recall) / (precision + recall) if (precision + recall) > 0 else 0.0
+        
+        metrics[class_id] = {
+            'tp': tp,
+            'fp': fp,
+            'fn': fn,
+            'precision': precision,
+            'recall': recall,
+            'f1': f1
+        }
+    
+    return metrics
+
+# Add this to your main processing loop, right after the missed detection analysis:
+
+# Initialize global metrics counters
+global_tp_per_class = {class_name: 0 for class_name in obj_list}
+global_fp_per_class = {class_name: 0 for class_name in obj_list}
+global_fn_per_class = {class_name: 0 for class_name in obj_list}
+
+print(f"Processing {len(image_ids)} images...")
+
+for image_id in tqdm(image_ids, desc="Processing Images"):
+    # Load image info
+    image_info = coco.loadImgs(image_id)[0]
+    image_path = os.path.join(args.data_path, params['val_set_name'], 
+                             image_info['file_name'])
+    image_name = os.path.splitext(image_info['file_name'])[0]
+    
+    if not os.path.exists(image_path):
+        print(f"Image not found: {image_path}")
+        continue
+    
+    # Load ground truth annotations
+    ann_ids = coco.getAnnIds(imgIds=image_id, iscrowd=False)
+    anns = coco.loadAnns(ann_ids)
+    
+    gt_boxes = []
+    gt_classes = []
+    
+    for ann in anns:
+        if ann['bbox'][2] < 1 or ann['bbox'][3] < 1:  # Skip invalid boxes
+            continue
+        
+        # Convert from [x, y, w, h] to [x1, y1, x2, y2]
+        x, y, w, h = ann['bbox']
+        gt_boxes.append([x, y, x + w, y + h])
+        gt_classes.append(ann['category_id'] - 1)  # Convert to 0-based indexing
+    
+    # Count total objects per class
+    class_name = obj_list[ann['category_id'] - 1]
+    total_objects_per_class[class_name] += 1
+    
+    if len(gt_boxes) == 0:
+        continue
+    
+    # Load the test image and run detection
+    model = get_model()
+    if 'net' not in model:
+        load_model()
+        model = get_model()
+    net, sig_net = model['net'], model['sig_net']
+    
+    image = Image.open(image_path)
+    
+    # Convert the image into a NumPy array for processing
+    image_array = np.array(image)
+    
+    # Initialize the VisualFeatureDetection class
+    detection = VisualFeatureDetection(process_feature_logger, 4)
+    pred_boxes = []
+    pred_classes = []
+    pred_scores = []
+    
+    # Perform detection on the image
+    det_data = detection.DetectImage(net, sig_net, image_array)
+    
+    class_mapping = {'signature': 0, 'barcode': 1, 'chop': 2, 'qrcode': 3}
+    for data in det_data:
+        y1, y2, x1, x2 = data['bbox']
+        label = data['class']
+        score = data['score']
+        pred_boxes.append([x1, y1, x2, y2])
+        pred_classes.append(class_mapping[label.lower()])
+        pred_scores.append(score)
+    
+    # Calculate metrics for this image
+    tp_per_class, fp_per_class, fn_per_class = calculate_detection_metrics(
+        gt_boxes, gt_classes, pred_boxes, pred_classes, pred_scores,
+        iou_threshold=args.iou_threshold, score_threshold=args.score_threshold
+    )
+    
+    # Add to global counters
+    for class_id in range(len(obj_list)):
+        class_name = obj_list[class_id]
+        global_tp_per_class[class_name] += tp_per_class.get(class_id, 0)
+        global_fp_per_class[class_name] += fp_per_class.get(class_id, 0)
+        global_fn_per_class[class_name] += fn_per_class.get(class_id, 0)
+
+# Calculate F1 scores after processing all images
+print("\n" + "="*50)
+print("F1 SCORE ANALYSIS")
+print("="*50)
+
+# Convert class names back to indices for calculation
+tp_per_class_idx = {i: global_tp_per_class[obj_list[i]] for i in range(len(obj_list))}
+fp_per_class_idx = {i: global_fp_per_class[obj_list[i]] for i in range(len(obj_list))}
+fn_per_class_idx = {i: global_fn_per_class[obj_list[i]] for i in range(len(obj_list))}
+
+metrics = calculate_f1_scores(tp_per_class_idx, fp_per_class_idx, fn_per_class_idx)
+
+total_tp, total_fp, total_fn = 0, 0, 0
+
+for class_id, class_name in enumerate(obj_list):
+    if class_id in metrics:
+        m = metrics[class_id]
+        total_tp += m['tp']
+        total_fp += m['fp'] 
+        total_fn += m['fn']
+        
+        print(f"{class_name:15}: "
+              f"P={m['precision']:.3f} "
+              f"R={m['recall']:.3f} "
+              f"F1={m['f1']:.3f} "
+              f"(TP:{m['tp']}, FP:{m['fp']}, FN:{m['fn']})")
+    else:
+        print(f"{class_name:15}: No detections")
+
+# Calculate macro-averaged F1 (average of per-class F1 scores)
+valid_f1_scores = [m['f1'] for m in metrics.values() if m['f1'] > 0]
+macro_f1 = sum(valid_f1_scores) / len(valid_f1_scores) if valid_f1_scores else 0.0
+
+# Calculate micro-averaged F1 (based on total TP, FP, FN)
+micro_precision = total_tp / (total_tp + total_fp) if (total_tp + total_fp) > 0 else 0.0
+micro_recall = total_tp / (total_tp + total_fn) if (total_tp + total_fn) > 0 else 0.0
+micro_f1 = 2 * (micro_precision * micro_recall) / (micro_precision + micro_recall) if (micro_precision + micro_recall) > 0 else 0.0
+
+print(f"\n{'OVERALL METRICS':15}")
+print(f"{'Macro F1':15}: {macro_f1:.3f}")
+print(f"{'Micro F1':15}: {micro_f1:.3f}")
+print(f"{'Micro Precision':15}: {micro_precision:.3f}")
+print(f"{'Micro Recall':15}: {micro_recall:.3f}")
+print(f"{'Total TP':15}: {total_tp}")
+print(f"{'Total FP':15}: {total_fp}")
+print(f"{'Total FN':15}: {total_fn}")
+
+print(f"\nCropped images saved to: {args.output_dir}")
+
+if __name__ == '__main__':
+    main()
