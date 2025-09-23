@@ -1,101 +1,54 @@
-import cv2
-import numpy as np
+#!/usr/bin/env python3
+import subprocess
+import sys
 
-def find_line_intersection(line1, line2):
-    """Find intersection point of two lines"""
-    rho1, theta1 = line1
-    rho2, theta2 = line2
-    
-    A = np.array([[np.cos(theta1), np.sin(theta1)],
-                  [np.cos(theta2), np.sin(theta2)]])
-    b = np.array([[rho1], [rho2]])
-    
+def check_onnxruntime_gpu():
     try:
-        point = np.linalg.solve(A, b)
-        return int(point[0]), int(point[1])
-    except:
-        return None
+        import onnxruntime as ort
+        providers = ort.get_available_providers()
+        gpu_support = 'CUDAExecutionProvider' in providers or 'ROCMExecutionProvider' in providers
+        print(f"ONNX Runtime GPU: {'✓' if gpu_support else '✗'}")
+        return gpu_support
+    except ImportError:
+        print("ONNX Runtime: Not installed")
+        return False
 
-def find_document_rectangle(image_path):
-    # Read image
-    img = cv2.imread(image_path)
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    
-    # Apply blur to reduce noise
-    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
-    
-    # Edge detection with lower thresholds for light edges
-    edges = cv2.Canny(blurred, 30, 80)
-    
-    # Find lines using Hough transform
-    lines = cv2.HoughLines(edges, 1, np.pi/180, threshold=100)
-    
-    if lines is None:
-        print("No lines found")
-        return img
-    
-    # Group lines by angle (vertical and horizontal)
-    horizontal_lines = []
-    vertical_lines = []
-    
-    for line in lines:
-        rho, theta = line[0]
-        angle = np.degrees(theta)
-        
-        # Horizontal lines (around 0° or 180°)
-        if abs(angle) < 20 or abs(angle - 180) < 20:
-            horizontal_lines.append((rho, theta))
-        # Vertical lines (around 90°)
-        elif abs(angle - 90) < 20:
-            vertical_lines.append((rho, theta))
-    
-    # Sort lines to get the outermost ones
-    horizontal_lines = sorted(horizontal_lines, key=lambda x: x[0])
-    vertical_lines = sorted(vertical_lines, key=lambda x: x[0])
-    
-    if len(horizontal_lines) >= 2 and len(vertical_lines) >= 2:
-        # Get the 4 outer lines
-        top_line = horizontal_lines[0]
-        bottom_line = horizontal_lines[-1]
-        left_line = vertical_lines[0]
-        right_line = vertical_lines[-1]
-        
-        # Find 4 corner intersections
-        top_left = find_line_intersection(top_line, left_line)
-        top_right = find_line_intersection(top_line, right_line)
-        bottom_left = find_line_intersection(bottom_line, left_line)
-        bottom_right = find_line_intersection(bottom_line, right_line)
-        
-        corners = [top_left, top_right, bottom_right, bottom_left]
-        
-        # Check if all intersections are valid
-        if all(corner is not None for corner in corners):
-            # Draw the rectangle
-            pts = np.array(corners, np.int32)
-            cv2.polylines(img, [pts], True, (0, 255, 0), 3)
-            
-            # Draw corner circles
-            for corner in corners:
-                cv2.circle(img, corner, 8, (255, 0, 0), -1)
-            
-            # Calculate bounding box
-            x_coords = [c[0] for c in corners]
-            y_coords = [c[1] for c in corners]
-            x, y = min(x_coords), min(y_coords)
-            w, h = max(x_coords) - x, max(y_coords) - y
-            
-            # Save result
-            cv2.imwrite('result.jpg', img)
-            
-            print(f"Document corners found:")
-            print(f"Top-left: {top_left}, Top-right: {top_right}")
-            print(f"Bottom-left: {bottom_left}, Bottom-right: {bottom_right}")
-            print(f"Bounding box: x={x}, y={y}, width={w}, height={h}")
-            
-            return img
-    
-    print("Could not find 4 document edges")
-    return img
+def check_mxnet_cuda():
+    try:
+        import mxnet as mx
+        gpu_support = mx.context.num_gpus() > 0
+        print(f"MXNet CUDA: {'✓' if gpu_support else '✗'}")
+        return gpu_support
+    except ImportError:
+        print("MXNet: Not installed")
+        return False
+    except Exception:
+        print("MXNet CUDA: ✗")
+        return False
 
-# Use it
-find_document_rectangle('your_image.jpg')
+def check_nvidia_smi():
+    try:
+        result = subprocess.run(['nvidia-smi', '--query-gpu=name,memory.total', '--format=csv,noheader'], 
+                              capture_output=True, text=True, timeout=10)
+        if result.returncode == 0:
+            print("nvidia-smi: ✓")
+            for line in result.stdout.strip().split('\n'):
+                if line.strip():
+                    print(f"  GPU: {line.strip()}")
+            return True
+        else:
+            print("nvidia-smi: ✗")
+            return False
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        print("nvidia-smi: ✗ (not found)")
+        return False
+
+if __name__ == "__main__":
+    print("GPU Support Check")
+    print("-" * 20)
+    
+    onnx_ok = check_onnxruntime_gpu()
+    mxnet_ok = check_mxnet_cuda()
+    nvidia_ok = check_nvidia_smi()
+    
+    print(f"\nOverall GPU Ready: {'✓' if any([onnx_ok, mxnet_ok]) and nvidia_ok else '✗'}")
