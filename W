@@ -1,10 +1,1 @@
-net = cv2.dnn.readNetFromTensorflow('opencv_face_detector_uint8.pb', 
-                                   'opencv_face_detector.pbtxt')
-blob = cv2.dnn.blobFromImage(roi, 1.0, (300, 300), [104, 117, 123])
-net.setInput(blob)
-detections = net.forward()
-MediaPipe (most robust):
-import mediapipe as mp
-mp_face = mp.solutions.face_detection
-face_detection = mp_face.FaceDetection(model_selection=0, min_detection_confidence=0.3)
-results = face_detection.process(cv2.cvtColor(roi, cv2.COLOR_BGR2RGB))
+https://github.com/opencv/opencv_3rdparty/raw/dnn_samples_face_detector_20170830/opencv_face_detector_uint8.pb
