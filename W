@@ -1,10 +1,23 @@
 prompt = f"""
-Return Hong Kong ID card bounding box as pixel coordinates for image size {img.size[0]}x{img.size[1]}.
+IMAGE ANALYSIS TASK - COORDINATE DETECTION
 
-Format: {{"x1": <int>, "y1": <int>, "x2": <int>, "y2": <int>}}
+Image dimensions: {img.size[0]} pixels wide × {img.size[1]} pixels tall
 
-Where:
-- (x1,y1) = top-left corner in pixels
-- (x2,y2) = bottom-right corner in pixels
-- Coordinates must be integers within image bounds
+STEP-BY-STEP INSTRUCTIONS:
+1. Scan the ENTIRE image systematically from left to right, top to bottom
+2. Look for the rectangular Hong Kong ID card containing a person's photo and text
+3. The card has these visual elements: person's photo on right side, Chinese/English text, official formatting
+4. Identify the exact pixel boundaries where the card edges are located
+
+COORDINATE REQUIREMENTS:
+- Return EXACT pixel coordinates as integers
+- x1,y1 = top-left corner of the card
+- x2,y2 = bottom-right corner of the card  
+- All values must be between 0 and image dimensions
+- Double-check coordinates before responding
+
+RESPONSE FORMAT (exact JSON):
+{{"x1": <integer>, "y1": <integer>, "x2": <integer>, "y2": <integer>}}
+
+CRITICAL: The card is a rectangular document with clear edges. Find the precise pixel boundaries where the document starts and ends.
 """
