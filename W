@@ -1,28 +1,10 @@
-import cv2
-
-# Load face detector
-face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
-
-# Get top 3 contours by area
-cnts = sorted(cnts, key=cv2.contourArea, reverse=True)[:3]
-
-# Check if areas are similar (within 20% of largest)
-max_area = cv2.contourArea(cnts[0])
-similar_contours = [c for c in cnts if cv2.contourArea(c) > 0.8 * max_area]
-
-if len(similar_contours) > 1:
-    # Multiple similar areas - check for faces
-    for c in similar_contours:
-        x, y, w, h = cv2.boundingRect(c)
-        roi = image[y:y+h, x:x+w]
-        
-        # Detect faces in this region
-        faces = face_cascade.detectMultiScale(roi, 1.1, 4)
-        
-        if len(faces) > 0:  # Face found - this is the ID
-            peri = cv2.arcLength(c, True)
-            screenCnt = cv2.approxPolyDP(c, 0.02 * peri, True)
-            break
-else:
-    # Single large contour - use it
-    screenCnt = cv2.approxPolyDP(cnts[0], 0.02 * cv2.arcLength(cnts[0], True), True)
+net = cv2.dnn.readNetFromTensorflow('opencv_face_detector_uint8.pb', 
+                                   'opencv_face_detector.pbtxt')
+blob = cv2.dnn.blobFromImage(roi, 1.0, (300, 300), [104, 117, 123])
+net.setInput(blob)
+detections = net.forward()
+MediaPipe (most robust):
+import mediapipe as mp
+mp_face = mp.solutions.face_detection
+face_detection = mp_face.FaceDetection(model_selection=0, min_detection_confidence=0.3)
+results = face_detection.process(cv2.cvtColor(roi, cv2.COLOR_BGR2RGB))
