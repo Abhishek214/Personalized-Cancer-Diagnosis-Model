@@ -1,32 +1,6 @@
-custom_prompt = """
-You are a document detection expert. Analyze the provided image and:
-
-1. Carefully examine the ENTIRE image for any identity card or document
-2. Look for rectangular documents with official formatting, text, and photo
-3. The document will have specific characteristics: official layout, person's photo, text fields, official seals/logos
-4. Return bounding box coordinates as: {"x1": <value>, "y1": <value>, "x2": <value>, "y2": <value>}
-5. Coordinates should tightly bound the document edges with minimal padding
-6. Double-check your coordinates are accurate before responding
-
-If no clear document is found, return {"error": "No document detected"}.
-
-IMPORTANT: Examine the full image carefully - the document may not be in the center.
-
-
-from PIL import Image
-import io
-
-def preprocess_image(image_path, max_size=1024):
-    with Image.open(image_path) as img:
-        # Resize if too large
-        if max(img.size) > max_size:
-            img.thumbnail((max_size, max_size), Image.Resampling.LANCZOS)
-        
-        # Convert to RGB if needed
-        if img.mode != 'RGB':
-            img = img.convert('RGB')
-        
-        # Save to bytes
-        buffer = io.BytesIO()
-        img.save(buffer, format='JPEG', quality=95)
-        return base64.b64encode(buffer.getvalue()).decode('ascii')
+"Detect the identity document/card in this image and return its bounding box coordinates as JSON: {\"x1\": <value>, \"y1\": <value>, \"x2\": <value>, \"y2\": <value>}",
+    
+    "Find the rectangular document with photo and text in this image. Return tight bounding box coordinates in JSON format.",
+    
+    "Locate the official identity card/document in the image. It contains a person's photo and official text. Return bounding box as {\"x1\": top-left-x, \"y1\": top-left-y, \"x2\": bottom-right-x, \"y2\": bottom-right-y}"
+]
