@@ -1,32 +1,28 @@
-# Apply morphological closing to connect nearby edges
-kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (20, 20))
-closed = cv2.morphologyEx(edged, cv2.MORPH_CLOSE, kernel)
+import cv2
 
-# Now find contours on the closed image
-cnts, _ = cv2.findContours(closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+# Load face detector
+face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
 
-# Filter by area and aspect ratio as before
-for c in cnts:
-    area = cv2.contourArea(c)
-    if area < 10000:
-        continue
-    
-    peri = cv2.arcLength(c, True)
-    approx = cv2.approxPolyDP(c, 0.02 * peri, True)
-    
-    if len(approx) == 4:
-        x, y, w, h = cv2.boundingRect(approx)
-        aspect_ratio = w / h
-        if 1.4 < aspect_ratio < 1.8:
-            screenCnt = approx
+# Get top 3 contours by area
+cnts = sorted(cnts, key=cv2.contourArea, reverse=True)[:3]
+
+# Check if areas are similar (within 20% of largest)
+max_area = cv2.contourArea(cnts[0])
+similar_contours = [c for c in cnts if cv2.contourArea(c) > 0.8 * max_area]
+
+if len(similar_contours) > 1:
+    # Multiple similar areas - check for faces
+    for c in similar_contours:
+        x, y, w, h = cv2.boundingRect(c)
+        roi = image[y:y+h, x:x+w]
+        
+        # Detect faces in this region
+        faces = face_cascade.detectMultiScale(roi, 1.1, 4)
+        
+        if len(faces) > 0:  # Face found - this is the ID
+            peri = cv2.arcLength(c, True)
+            screenCnt = cv2.approxPolyDP(c, 0.02 * peri, True)
             break
-Alternative approach - find bounding box of all edge pixels in the ID region:
-# Find all contours
-cnts, _ = cv2.findContours(edged, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
-# Combine all contours in the ID area
-all_points = np.vstack([c for c in cnts if cv2.contourArea(c) > 100])
-x, y, w, h = cv2.boundingRect(all_points)
-
-# Create rectangle contour
-screenCnt = np.array([[x,y], [x+w,y], [x+w,y+h], [x,y+h]])
+else:
+    # Single large contour - use it
+    screenCnt = cv2.approxPolyDP(cnts[0], 0.02 * cv2.arcLength(cnts[0], True), True)
