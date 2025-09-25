@@ -1,135 +1,32 @@
-import cv2
-import numpy as np
-from paddleocr import PaddleOCR
-import json
+# Apply morphological closing to connect nearby edges
+kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (20, 20))
+closed = cv2.morphologyEx(edged, cv2.MORPH_CLOSE, kernel)
 
-def detect_document_bbox(image_path):
-    """
-    Detect document bounding box using PaddleOCR
-    """
-    # Initialize PaddleOCR
-    ocr = PaddleOCR(use_angle_cls=True, lang='en', show_log=False)
-    
-    # Run OCR
-    results = ocr.ocr(image_path, cls=True)
-    
-    if not results or not results[0]:
-        return {"error": "No text detected"}
-    
-    # Extract all text box coordinates
-    all_boxes = []
-    for line in results[0]:
-        box = line[0]  # Coordinates of text box
-        all_boxes.extend(box)
-    
-    if not all_boxes:
-        return {"error": "No text boxes found"}
-    
-    # Convert to numpy array for easier processing
-    all_boxes = np.array(all_boxes)
-    
-    # Find overall bounding box
-    x_min = int(np.min(all_boxes[:, 0]))
-    y_min = int(np.min(all_boxes[:, 1]))
-    x_max = int(np.max(all_boxes[:, 0]))
-    y_max = int(np.max(all_boxes[:, 1]))
-    
-    # Add padding around text region
-    img = cv2.imread(image_path)
-    h, w = img.shape[:2]
-    
-    padding = 20
-    x_min = max(0, x_min - padding)
-    y_min = max(0, y_min - padding)
-    x_max = min(w, x_max + padding)
-    y_max = min(h, y_max + padding)
-    
-    return {
-        "x1": x_min,
-        "y1": y_min, 
-        "x2": x_max,
-        "y2": y_max
-    }
+# Now find contours on the closed image
+cnts, _ = cv2.findContours(closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
-def visualize_detection(image_path, bbox):
-    """
-    Draw bounding box on image and save result
-    """
-    img = cv2.imread(image_path)
+# Filter by area and aspect ratio as before
+for c in cnts:
+    area = cv2.contourArea(c)
+    if area < 10000:
+        continue
     
-    if "error" not in bbox:
-        cv2.rectangle(img, (bbox['x1'], bbox['y1']), (bbox['x2'], bbox['y2']), (0, 255, 0), 3)
+    peri = cv2.arcLength(c, True)
+    approx = cv2.approxPolyDP(c, 0.02 * peri, True)
     
-    cv2.imwrite('detected_bbox.jpg', img)
-    return img
+    if len(approx) == 4:
+        x, y, w, h = cv2.boundingRect(approx)
+        aspect_ratio = w / h
+        if 1.4 < aspect_ratio < 1.8:
+            screenCnt = approx
+            break
+Alternative approach - find bounding box of all edge pixels in the ID region:
+# Find all contours
+cnts, _ = cv2.findContours(edged, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
-def detect_with_text_clustering(image_path):
-    """
-    Enhanced detection using text clustering
-    """
-    ocr = PaddleOCR(use_angle_cls=True, lang='en', show_log=False)
-    results = ocr.ocr(image_path, cls=True)
-    
-    if not results or not results[0]:
-        return {"error": "No text detected"}
-    
-    # Get text boxes and confidence scores
-    text_regions = []
-    for line in results[0]:
-        box = line[0]
-        text = line[1][0]
-        confidence = line[1][1]
-        
-        if confidence > 0.5:  # Filter low-confidence detections
-            # Calculate center and area of text box
-            box = np.array(box)
-            center_x = np.mean(box[:, 0])
-            center_y = np.mean(box[:, 1])
-            area = cv2.contourArea(box.astype(np.int32))
-            
-            text_regions.append({
-                'box': box,
-                'center': (center_x, center_y),
-                'area': area,
-                'text': text
-            })
-    
-    if not text_regions:
-        return {"error": "No valid text regions found"}
-    
-    # Find document region by clustering text boxes
-    all_points = []
-    for region in text_regions:
-        all_points.extend(region['box'].tolist())
-    
-    all_points = np.array(all_points)
-    
-    # Calculate convex hull for better document boundary
-    hull = cv2.convexHull(all_points.astype(np.float32))
-    
-    # Get bounding rectangle of convex hull
-    x, y, w, h = cv2.boundingRect(hull)
-    
-    return {
-        "x1": int(x),
-        "y1": int(y),
-        "x2": int(x + w),
-        "y2": int(y + h),
-        "detected_texts": len(text_regions)
-    }
+# Combine all contours in the ID area
+all_points = np.vstack([c for c in cnts if cv2.contourArea(c) > 100])
+x, y, w, h = cv2.boundingRect(all_points)
 
-# Usage
-if __name__ == "__main__":
-    image_path = "your_image.jpg"
-    
-    # Method 1: Simple bbox from text regions
-    bbox1 = detect_document_bbox(image_path)
-    print("Simple detection:", bbox1)
-    
-    # Method 2: Enhanced with clustering
-    bbox2 = detect_with_text_clustering(image_path)
-    print("Enhanced detection:", bbox2)
-    
-    # Visualize results
-    visualize_detection(image_path, bbox2)
-    print("Result saved as 'detected_bbox.jpg'")
+# Create rectangle contour
+screenCnt = np.array([[x,y], [x+w,y], [x+w,y+h], [x,y+h]])
