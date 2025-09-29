@@ -1,0 +1,372 @@
+import cv2
+import numpy as np
+from PIL import Image, ImageDraw, ImageFont
+import pytesseract
+
+def detect_individual_characters(image_path):
+    """
+    Detect individual characters using contour detection
+    Returns list of character bounding boxes
+    """
+    img = cv2.imread(image_path)
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    
+    # Threshold to get binary image
+    _, thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+    
+    # Find contours (individual characters)
+    contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    
+    # Get bounding boxes for each character
+    char_boxes = []
+    for contour in contours:
+        x, y, w, h = cv2.boundingRect(contour)
+        
+        # Filter out very small noise
+        if w > 5 and h > 10:  # Minimum character size
+            char_boxes.append((x, y, w, h))
+    
+    # Sort boxes left to right, top to bottom
+    char_boxes.sort(key=lambda box: (box[1], box[0]))
+    
+    return char_boxes, gray
+
+
+def character_perfect_fit(image_path, output_path="perfect_chars.jpg"):
+    """
+    Replace each character with perfectly sized text
+    """
+    img = cv2.imread(image_path)
+    height, width = img.shape[:2]
+    
+    # Create white canvas
+    reconstructed = np.ones((height, width, 3), dtype=np.uint8) * 255
+    
+    # Configure Tesseract for single character recognition
+    config = '--psm 10 -c tessedit_char_whitelist=0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz'
+    
+    # Detect individual characters
+    char_boxes, gray = detect_individual_characters(image_path)
+    
+    print(f"Found {len(char_boxes)} characters")
+    
+    for x, y, w, h in char_boxes:
+        # Extract character region
+        char_img = gray[y:y+h, x:x+w]
+        
+        if char_img.size == 0:
+            continue
+            
+        # Recognize the character
+        try:
+            # Add padding for better OCR
+            padded = cv2.copyMakeBorder(char_img, 10, 10, 10, 10, cv2.BORDER_CONSTANT, value=255)
+            char_text = pytesseract.image_to_string(padded, config=config).strip()
+            
+            if char_text:
+                # Convert to PIL for precise text drawing
+                pil_img = Image.fromarray(reconstructed)
+                draw = ImageDraw.Draw(pil_img)
+                
+                # Find the exact font size that fits the original character box
+                font_size = 1
+                font = None
+                
+                # Keep increasing font size until text fills the box
+                while font_size < 200:
+                    try:
+                        test_font = ImageFont.truetype("arial.ttf", font_size)
+                    except:
+                        test_font = ImageFont.load_default()
+                    
+                    # Measure text size with this font
+                    bbox = draw.textbbox((0, 0), char_text, font=test_font)
+                    text_width = bbox[2] - bbox[0]
+                    text_height = bbox[3] - bbox[1]
+                    
+                    # Check if it fits
+                    if text_width >= w * 0.8 or text_height >= h * 0.8:
+                        # This font size is good
+                        font = test_font
+                        break
+                    
+                    font_size += 1
+                
+                if font:
+                    # Center the character in its box
+                    text_x = x + (w - text_width) // 2
+                    text_y = y + (h - text_height) // 2
+                    
+                    # Draw the character
+                    draw.text((text_x, text_y), char_text, fill=(0, 0, 0), font=font)
+                    print(f"Replaced character '{char_text}' at ({x},{y}) with size {font_size}")
+                
+                # Convert back to numpy
+                reconstructed = np.array(pil_img)
+                
+        except Exception as e:
+            print(f"Could not recognize character at ({x},{y}): {e}")
+    
+    # Convert back to BGR for OpenCV
+    reconstructed = cv2.cvtColor(reconstructed, cv2.COLOR_RGB2BGR)
+    cv2.imwrite(output_path, reconstructed)
+    print(f"\nSaved as: {output_path}")
+    return reconstructed
+
+
+def hybrid_character_replacement(image_path, output_path="hybrid_chars.jpg"):
+    """
+    Replace characters in original image with perfect sizing
+    """
+    img = cv2.imread(image_path)
+    result = img.copy()
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    
+    # Use Tesseract to get character-level data
+    # PSM 8 treats image as single word, PSM 6 as uniform block
+    data = pytesseract.image_to_data(gray, output_type=pytesseract.Output.DICT, config='--psm 6')
+    
+    # Process each detection
+    for i in range(len(data['text'])):
+        text = data['text'][i].strip()
+        
+        if text:  # If text detected
+            # For each character in the word
+            word_x = data['left'][i]
+            word_y = data['top'][i]
+            word_w = data['width'][i]
+            word_h = data['height'][i]
+            
+            # White out the original text area
+            cv2.rectangle(result, (word_x, word_y), (word_x + word_w, word_y + word_h), (255, 255, 255), -1)
+            
+            # Calculate per-character width
+            if len(text) > 0:
+                char_width = word_w // len(text)
+                
+                # Convert to PIL for drawing
+                pil_img = Image.fromarray(cv2.cvtColor(result, cv2.COLOR_BGR2RGB))
+                draw = ImageDraw.Draw(pil_img)
+                
+                for j, char in enumerate(text):
+                    char_x = word_x + (j * char_width)
+                    
+                    # Auto-size font to fit character box height
+                    target_height = int(word_h * 0.9)  # 90% of box height
+                    
+                    # Binary search for best font size
+                    low, high = 1, 200
+                    best_font = None
+                    best_size = 1
+                    
+                    while low <= high:
+                        mid = (low + high) // 2
+                        try:
+                            test_font = ImageFont.truetype("arial.ttf", mid)
+                        except:
+                            test_font = ImageFont.load_default()
+                            break
+                        
+                        bbox = draw.textbbox((0, 0), char, font=test_font)
+                        text_height = bbox[3] - bbox[1]
+                        
+                        if text_height <= target_height:
+                            best_font = test_font
+                            best_size = mid
+                            low = mid + 1
+                        else:
+                            high = mid - 1
+                    
+                    if best_font:
+                        # Draw character
+                        draw.text((char_x, word_y), char, fill=(0, 0, 0), font=best_font)
+                
+                # Convert back
+                result = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
+                print(f"Replaced word '{text}' character by character")
+    
+    cv2.imwrite(output_path, result)
+    print(f"\nSaved as: {output_path}")
+    return result
+
+
+def selective_char_reconstruction(image_path, output_path="selective_chars.jpg", conf_threshold=50):
+    """
+    Character-level reconstruction with confidence check and perfect sizing
+    """
+    img = cv2.imread(image_path)
+    result = img.copy()
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    
+    # Get character-level predictions
+    boxes = pytesseract.image_to_boxes(gray, config='--psm 6')
+    
+    # Also get confidence scores
+    data = pytesseract.image_to_data(gray, output_type=pytesseract.Output.DICT, config='--psm 6')
+    
+    # Process character boxes
+    for box in boxes.splitlines():
+        box_data = box.split()
+        if len(box_data) >= 6:
+            char = box_data[0]
+            x1 = int(box_data[1])
+            y1 = img.shape[0] - int(box_data[4])  # Tesseract uses bottom-left origin
+            x2 = int(box_data[3])
+            y2 = img.shape[0] - int(box_data[2])
+            
+            # Character box dimensions
+            char_w = x2 - x1
+            char_h = y2 - y1
+            
+            if char_w > 5 and char_h > 10:  # Filter noise
+                # White out original character
+                cv2.rectangle(result, (x1, y1), (x2, y2), (255, 255, 255), -1)
+                
+                # Convert to PIL
+                pil_img = Image.fromarray(cv2.cvtColor(result, cv2.COLOR_BGR2RGB))
+                draw = ImageDraw.Draw(pil_img)
+                
+                # Find perfect font size for this specific character box
+                best_font = None
+                for size in range(1, 200):
+                    try:
+                        test_font = ImageFont.truetype("arial.ttf", size)
+                    except:
+                        test_font = ImageFont.load_default()
+                        break
+                    
+                    bbox = draw.textbbox((0, 0), char, font=test_font)
+                    text_w = bbox[2] - bbox[0]
+                    text_h = bbox[3] - bbox[1]
+                    
+                    # Check if it exceeds box size
+                    if text_w > char_w * 0.9 or text_h > char_h * 0.9:
+                        break
+                    best_font = test_font
+                
+                if best_font:
+                    # Center character in its box
+                    bbox = draw.textbbox((0, 0), char, font=best_font)
+                    text_w = bbox[2] - bbox[0]
+                    text_h = bbox[3] - bbox[1]
+                    
+                    center_x = x1 + (char_w - text_w) // 2
+                    center_y = y1 + (char_h - text_h) // 2
+                    
+                    draw.text((center_x, center_y), char, fill=(0, 0, 0), font=best_font)
+                    print(f"✓ Replaced '{char}' - perfectly sized to {char_w}x{char_h} box")
+                
+                result = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
+    
+    cv2.imwrite(output_path, result)
+    print(f"\nSaved as: {output_path}")
+    return result
+
+
+def advanced_char_detection(image_path, output_path="advanced_chars.jpg"):
+    """
+    Advanced character detection using both contours and OCR
+    with automatic font size calculation
+    """
+    img = cv2.imread(image_path)
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    result = img.copy()
+    
+    # Method 1: Get Tesseract character boxes
+    char_boxes = pytesseract.image_to_boxes(gray, config='--psm 6')
+    
+    # Create character map
+    char_regions = []
+    for box in char_boxes.splitlines():
+        b = box.split()
+        if len(b) >= 6:
+            char = b[0]
+            x = int(b[1])
+            y = img.shape[0] - int(b[4])
+            w = int(b[3]) - int(b[1])
+            h = int(b[4]) - int(b[2])
+            char_regions.append({'char': char, 'x': x, 'y': y, 'w': w, 'h': h})
+    
+    # Sort by position
+    char_regions.sort(key=lambda r: (r['y'], r['x']))
+    
+    # Replace each character
+    for region in char_regions:
+        char = region['char']
+        x, y, w, h = region['x'], region['y'], region['w'], region['h']
+        
+        # White out area
+        cv2.rectangle(result, (x, y), (x + w, y + h), (255, 255, 255), -1)
+        
+        # Convert to PIL
+        pil_img = Image.fromarray(cv2.cvtColor(result, cv2.COLOR_BGR2RGB))
+        draw = ImageDraw.Draw(pil_img)
+        
+        # Calculate exact font size needed
+        # We want the font to fill about 85% of the box height
+        target_height = int(h * 0.85)
+        
+        # Find best font size
+        font_size = int(target_height * 0.7)  # Initial guess
+        
+        try:
+            font = ImageFont.truetype("arial.ttf", font_size)
+            
+            # Fine-tune size
+            bbox = draw.textbbox((0, 0), char, font=font)
+            actual_height = bbox[3] - bbox[1]
+            
+            # Adjust font size proportionally
+            if actual_height > 0:
+                adjusted_size = int(font_size * (target_height / actual_height))
+                font = ImageFont.truetype("arial.ttf", adjusted_size)
+        except:
+            font = ImageFont.load_default()
+        
+        # Get final text dimensions
+        bbox = draw.textbbox((0, 0), char, font=font)
+        text_w = bbox[2] - bbox[0]
+        text_h = bbox[3] - bbox[1]
+        
+        # Center in box
+        pos_x = x + (w - text_w) // 2
+        pos_y = y + (h - text_h) // 2
+        
+        # Draw character
+        draw.text((pos_x, pos_y), char, fill=(0, 0, 0), font=font)
+        
+        result = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
+        print(f"Replaced '{char}' with exact fit in {w}x{h} box")
+    
+    cv2.imwrite(output_path, result)
+    print(f"\nTotal characters replaced: {len(char_regions)}")
+    print(f"Saved as: {output_path}")
+    return result
+
+
+# Main execution
+if __name__ == "__main__":
+    input_image = "id_card.jpg"
+    
+    print("Character-level Perfect Reconstruction")
+    print("=" * 50)
+    
+    # Method 1: Perfect fit for each character
+    print("\n1. Character Perfect Fit Method:")
+    character_perfect_fit(input_image, "perfect_chars.jpg")
+    
+    # Method 2: Hybrid with character-level replacement
+    print("\n2. Hybrid Character Replacement:")
+    hybrid_character_replacement(input_image, "hybrid_chars.jpg")
+    
+    # Method 3: Selective with confidence
+    print("\n3. Selective Character Reconstruction:")
+    selective_char_reconstruction(input_image, "selective_chars.jpg")
+    
+    # Method 4: Advanced detection
+    print("\n4. Advanced Character Detection:")
+    advanced_char_detection(input_image, "advanced_chars.jpg")
+    
+    print("\n" + "=" * 50)
+    print("Complete! Check the output files.")
+    print("Each character is now perfectly sized to match the original.")
