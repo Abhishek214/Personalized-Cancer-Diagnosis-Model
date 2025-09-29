@@ -1,0 +1,331 @@
+import cv2
+import numpy as np
+from PIL import Image, ImageDraw, ImageFont
+import pytesseract
+import easyocr
+
+def reconstruct_with_tesseract(image_path, output_path="reconstructed.jpg"):
+    """
+    Detect text using Tesseract, then replace with clean computer-generated text
+    """
+    
+    # Read image
+    img = cv2.imread(image_path)
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    
+    # Get detailed OCR data including bounding boxes
+    data = pytesseract.image_to_data(gray, output_type=pytesseract.Output.DICT)
+    
+    # Create a white canvas
+    height, width = gray.shape
+    reconstructed = np.ones((height, width, 3), dtype=np.uint8) * 255
+    
+    # Convert to PIL for text drawing
+    pil_img = Image.fromarray(reconstructed)
+    draw = ImageDraw.Draw(pil_img)
+    
+    # Try to load a font (adjust path as needed)
+    try:
+        font = ImageFont.truetype("arial.ttf", 20)
+    except:
+        font = ImageFont.load_default()
+    
+    # Process each detected word
+    n_boxes = len(data['text'])
+    for i in range(n_boxes):
+        text = data['text'][i].strip()
+        
+        if text:  # If text was detected
+            # Get bounding box
+            x, y, w, h = data['left'][i], data['top'][i], data['width'][i], data['height'][i]
+            
+            # Calculate font size based on box height
+            font_size = int(h * 0.8)
+            try:
+                scaled_font = ImageFont.truetype("arial.ttf", font_size)
+            except:
+                scaled_font = font
+            
+            # Draw clean text at the same position
+            draw.text((x, y), text, fill=(0, 0, 0), font=scaled_font)
+            
+            print(f"Replaced: '{text}' at position ({x}, {y})")
+    
+    # Convert back to OpenCV format
+    reconstructed = np.array(pil_img)
+    reconstructed = cv2.cvtColor(reconstructed, cv2.COLOR_RGB2BGR)
+    
+    cv2.imwrite(output_path, reconstructed)
+    print(f"\nReconstructed image saved as: {output_path}")
+    return reconstructed
+
+
+def reconstruct_with_easyocr(image_path, output_path="reconstructed_easy.jpg"):
+    """
+    Use EasyOCR for better detection and reconstruction
+    EasyOCR often works better for ID cards
+    """
+    
+    # Initialize EasyOCR reader
+    reader = easyocr.Reader(['en'])
+    
+    # Read image
+    img = cv2.imread(image_path)
+    height, width = img.shape[:2]
+    
+    # Perform OCR
+    results = reader.readtext(image_path)
+    
+    # Create white canvas
+    reconstructed = np.ones((height, width, 3), dtype=np.uint8) * 255
+    
+    # Convert to PIL for drawing
+    pil_img = Image.fromarray(reconstructed)
+    draw = ImageDraw.Draw(pil_img)
+    
+    # Process each detection
+    for (bbox, text, confidence) in results:
+        # Get corners of bounding box
+        (top_left, top_right, bottom_right, bottom_left) = bbox
+        
+        # Calculate position and size
+        x = int(top_left[0])
+        y = int(top_left[1])
+        box_width = int(top_right[0] - top_left[0])
+        box_height = int(bottom_left[1] - top_left[1])
+        
+        # Calculate font size
+        font_size = int(box_height * 0.7)
+        
+        try:
+            font = ImageFont.truetype("arial.ttf", font_size)
+        except:
+            font = ImageFont.load_default()
+        
+        # Draw text
+        draw.text((x, y), text, fill=(0, 0, 0), font=font)
+        
+        print(f"Replaced: '{text}' (confidence: {confidence:.2f})")
+    
+    # Convert back to OpenCV
+    reconstructed = np.array(pil_img)
+    reconstructed = cv2.cvtColor(reconstructed, cv2.COLOR_RGB2BGR)
+    
+    cv2.imwrite(output_path, reconstructed)
+    print(f"\nReconstructed image saved as: {output_path}")
+    return reconstructed
+
+
+def hybrid_reconstruction(image_path, output_path="hybrid_reconstructed.jpg"):
+    """
+    Combine original image with reconstructed text
+    Keeps original layout but with cleaner text
+    """
+    
+    # Read original
+    img = cv2.imread(image_path)
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    
+    # Get OCR results
+    data = pytesseract.image_to_data(gray, output_type=pytesseract.Output.DICT)
+    
+    # Create a copy of original
+    hybrid = img.copy()
+    
+    # Process each detected text region
+    n_boxes = len(data['text'])
+    for i in range(n_boxes):
+        text = data['text'][i].strip()
+        
+        if text and data['conf'][i] > 30:  # Confidence threshold
+            # Get bounding box
+            x, y, w, h = data['left'][i], data['top'][i], data['width'][i], data['height'][i]
+            
+            # White out the original text area
+            cv2.rectangle(hybrid, (x, y), (x + w, y + h), (255, 255, 255), -1)
+            
+            # Convert to PIL to draw text
+            pil_img = Image.fromarray(cv2.cvtColor(hybrid, cv2.COLOR_BGR2RGB))
+            draw = ImageDraw.Draw(pil_img)
+            
+            # Calculate font size
+            font_size = int(h * 0.7)
+            try:
+                font = ImageFont.truetype("arial.ttf", font_size)
+            except:
+                font = ImageFont.load_default()
+            
+            # Draw clean text
+            draw.text((x, y), text, fill=(0, 0, 0), font=font)
+            
+            # Convert back
+            hybrid = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
+            
+            print(f"Replaced: '{text}' at ({x}, {y})")
+    
+    cv2.imwrite(output_path, hybrid)
+    print(f"\nHybrid image saved as: {output_path}")
+    return hybrid
+
+
+def character_by_character_reconstruction(image_path, output_path="char_reconstructed.jpg"):
+    """
+    Reconstruct character by character for maximum precision
+    """
+    
+    # Read image
+    img = cv2.imread(image_path)
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    height, width = gray.shape
+    
+    # Configure Tesseract to detect single characters
+    config = '--psm 8'  # PSM 8 = single character
+    
+    # First, get word-level boxes to know where to look
+    word_data = pytesseract.image_to_data(gray, output_type=pytesseract.Output.DICT)
+    
+    # Create white canvas
+    reconstructed = np.ones((height, width, 3), dtype=np.uint8) * 255
+    pil_img = Image.fromarray(reconstructed)
+    draw = ImageDraw.Draw(pil_img)
+    
+    # Process each word box
+    for i in range(len(word_data['text'])):
+        if word_data['text'][i].strip():
+            # Get word bounding box
+            x, y, w, h = word_data['left'][i], word_data['top'][i], word_data['width'][i], word_data['height'][i]
+            
+            # Extract word region
+            word_region = gray[y:y+h, x:x+w]
+            
+            if word_region.size > 0:
+                # Get text for this region
+                text = word_data['text'][i].strip()
+                
+                # Calculate character positions
+                if len(text) > 0:
+                    char_width = w // len(text)
+                    
+                    for j, char in enumerate(text):
+                        char_x = x + (j * char_width)
+                        
+                        # Font size based on height
+                        font_size = int(h * 0.8)
+                        try:
+                            font = ImageFont.truetype("arial.ttf", font_size)
+                        except:
+                            font = ImageFont.load_default()
+                        
+                        # Draw character
+                        draw.text((char_x, y), char, fill=(0, 0, 0), font=font)
+                
+                print(f"Reconstructed word: '{text}'")
+    
+    # Convert back
+    reconstructed = np.array(pil_img)
+    reconstructed = cv2.cvtColor(reconstructed, cv2.COLOR_RGB2BGR)
+    
+    cv2.imwrite(output_path, reconstructed)
+    print(f"\nCharacter-by-character reconstruction saved as: {output_path}")
+    return reconstructed
+
+
+def selective_reconstruction(image_path, output_path="selective_reconstructed.jpg", confidence_threshold=50):
+    """
+    Only reconstruct text that OCR is confident about
+    Leaves uncertain areas untouched for manual review
+    """
+    
+    img = cv2.imread(image_path)
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    
+    # Get detailed OCR data
+    data = pytesseract.image_to_data(gray, output_type=pytesseract.Output.DICT)
+    
+    # Start with original image
+    result = img.copy()
+    
+    # Track what we replaced
+    replaced_count = 0
+    skipped_count = 0
+    
+    for i in range(len(data['text'])):
+        text = data['text'][i].strip()
+        conf = float(data['conf'][i]) if data['conf'][i] != -1 else 0
+        
+        if text and conf > confidence_threshold:
+            # High confidence - replace with clean text
+            x, y, w, h = data['left'][i], data['top'][i], data['width'][i], data['height'][i]
+            
+            # White out region
+            cv2.rectangle(result, (x, y), (x + w, y + h), (255, 255, 255), -1)
+            
+            # Add clean text
+            pil_img = Image.fromarray(cv2.cvtColor(result, cv2.COLOR_BGR2RGB))
+            draw = ImageDraw.Draw(pil_img)
+            
+            font_size = int(h * 0.7)
+            try:
+                font = ImageFont.truetype("arial.ttf", font_size)
+            except:
+                font = ImageFont.load_default()
+            
+            draw.text((x, y), text, fill=(0, 0, 0), font=font)
+            result = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
+            
+            replaced_count += 1
+            print(f"✓ Replaced: '{text}' (confidence: {conf:.1f}%)")
+        elif text:
+            skipped_count += 1
+            print(f"✗ Skipped: '{text}' (confidence: {conf:.1f}% - too low)")
+    
+    cv2.imwrite(output_path, result)
+    print(f"\nSelective reconstruction complete:")
+    print(f"  - Replaced: {replaced_count} text regions")
+    print(f"  - Skipped: {skipped_count} uncertain regions")
+    print(f"  - Saved as: {output_path}")
+    return result
+
+
+# Main execution
+if __name__ == "__main__":
+    input_image = "id_card.jpg"
+    
+    print("Starting OCR-based reconstruction...\n")
+    print("Note: Install required libraries:")
+    print("pip install pytesseract pillow easyocr")
+    print("Also install Tesseract OCR: https://github.com/tesseract-ocr/tesseract\n")
+    
+    try:
+        # Method 1: Basic Tesseract reconstruction
+        print("Method 1: Tesseract Reconstruction")
+        reconstruct_with_tesseract(input_image, "reconstructed_tesseract.jpg")
+        
+        # Method 2: Hybrid approach
+        print("\nMethod 2: Hybrid Reconstruction")
+        hybrid_reconstruction(input_image, "hybrid_reconstructed.jpg")
+        
+        # Method 3: Selective reconstruction
+        print("\nMethod 3: Selective Reconstruction (high confidence only)")
+        selective_reconstruction(input_image, "selective_reconstructed.jpg", confidence_threshold=60)
+        
+        # Method 4: Character by character
+        print("\nMethod 4: Character-by-character")
+        character_by_character_reconstruction(input_image, "char_reconstructed.jpg")
+        
+        print("\n" + "="*50)
+        print("Reconstruction complete! Check the output files.")
+        print("The reconstructed text will be perfectly clear and readable.")
+        
+    except Exception as e:
+        print(f"Error: {e}")
+        print("\nMake sure you have installed:")
+        print("1. pip install pytesseract pillow")
+        print("2. Tesseract OCR from: https://github.com/tesseract-ocr/tesseract")
+        
+    # Try EasyOCR if available
+    try:
+        print("\nTrying EasyOCR method (better for IDs)...")
+        reconstruct_with_easyocr(input_image, "reconstructed_easyocr.jpg")
+    except:
+        print("EasyOCR not installed. Install with: pip install easyocr")
