@@ -1,262 +1,111 @@
 import cv2
 import numpy as np
-from PIL import Image, ImageEnhance
-import matplotlib.pyplot as plt
 
-def enhance_text_quality(image_path, output_path=None):
+def enhance_black_pixels(image_path, output_path="enhanced.jpg", darkness_threshold=150):
     """
-    Enhance text quality in an image for better OCR recognition
+    Simple function to make dark pixels (text) darker and more uniform
+    
+    Parameters:
+    - image_path: path to input image
+    - output_path: path to save enhanced image
+    - darkness_threshold: pixels darker than this will be enhanced (0-255)
     """
-    # Read the image
+    
+    # Read image
     img = cv2.imread(image_path)
-    original = img.copy()
     
     # Convert to grayscale
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     
-    # Step 1: Denoise the image
-    denoised = cv2.fastNlMeansDenoising(gray, None, h=10, templateWindowSize=7, searchWindowSize=21)
+    # Find dark pixels (likely text)
+    # Pixels below threshold are considered text
+    mask = gray < darkness_threshold
     
-    # Step 2: Apply CLAHE (Contrast Limited Adaptive Histogram Equalization)
-    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
-    enhanced = clahe.apply(denoised)
+    # Make dark pixels uniformly darker
+    enhanced = gray.copy()
+    enhanced[mask] = 0  # Make text pixels pure black
     
-    # Step 3: Apply bilateral filter to reduce noise while keeping edges sharp
-    bilateral = cv2.bilateralFilter(enhanced, 9, 75, 75)
+    # Optional: Make light pixels uniformly lighter (background)
+    enhanced[~mask] = 255  # Make background pure white
     
-    # Step 4: Apply adaptive thresholding to get better text regions
-    adaptive_thresh = cv2.adaptiveThreshold(bilateral, 255, 
-                                           cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
-                                           cv2.THRESH_BINARY, 11, 2)
+    # Save result
+    cv2.imwrite(output_path, enhanced)
     
-    # Step 5: Apply morphological operations to connect broken text
-    kernel = np.ones((1,1), np.uint8)
-    morph = cv2.morphologyEx(adaptive_thresh, cv2.MORPH_CLOSE, kernel)
-    morph = cv2.morphologyEx(morph, cv2.MORPH_OPEN, kernel)
-    
-    # Step 6: Apply additional sharpening
-    kernel_sharpen = np.array([[-1,-1,-1],
-                               [-1, 9,-1],
-                               [-1,-1,-1]])
-    sharpened = cv2.filter2D(bilateral, -1, kernel_sharpen)
-    
-    # Step 7: Final adaptive threshold with different parameters
-    final_thresh = cv2.adaptiveThreshold(sharpened, 255,
-                                        cv2.ADAPTIVE_THRESH_MEAN_C,
-                                        cv2.THRESH_BINARY, 15, 10)
-    
-    # Step 8: Combine techniques - weighted average
-    combined = cv2.addWeighted(morph, 0.5, final_thresh, 0.5, 0)
-    
-    # Optional: Apply median filter to remove salt and pepper noise
-    final = cv2.medianBlur(combined, 1)
-    
-    if output_path:
-        cv2.imwrite(output_path, final)
-    
-    return gray, enhanced, adaptive_thresh, final
+    print(f"Enhanced image saved as: {output_path}")
+    return enhanced
 
-def enhance_with_pillow(image_path, output_path=None):
-    """
-    Alternative enhancement using PIL/Pillow library
-    """
-    # Open the image
-    img = Image.open(image_path)
-    
-    # Convert to grayscale
-    img = img.convert('L')
-    
-    # Enhance contrast
-    enhancer = ImageEnhance.Contrast(img)
-    img = enhancer.enhance(2.0)
-    
-    # Enhance sharpness
-    enhancer = ImageEnhance.Sharpness(img)
-    img = enhancer.enhance(2.0)
-    
-    # Convert to numpy array for OpenCV processing
-    img_array = np.array(img)
-    
-    # Apply threshold to make text darker
-    _, binary = cv2.threshold(img_array, 127, 255, cv2.THRESH_BINARY)
-    
-    # Apply Otsu's thresholding
-    _, otsu = cv2.threshold(img_array, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    
-    if output_path:
-        cv2.imwrite(output_path, otsu)
-    
-    return img_array, binary, otsu
 
-def process_and_display(image_path):
+def enhance_black_pixels_gradual(image_path, output_path="enhanced_gradual.jpg", darkness_threshold=150):
     """
-    Process the image and display results
+    Gradually darken pixels based on how dark they already are
+    Better for maintaining some detail in characters
     """
-    # Method 1: OpenCV enhancement
-    gray, enhanced, adaptive, final = enhance_text_quality(image_path)
     
-    # Method 2: PIL enhancement
-    pil_gray, pil_binary, pil_otsu = enhance_with_pillow(image_path)
+    # Read image
+    img = cv2.imread(image_path)
     
-    # Create a figure to show all results
-    fig, axes = plt.subplots(3, 3, figsize=(15, 15))
+    # Convert to grayscale  
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     
-    # Display images
-    axes[0, 0].imshow(gray, cmap='gray')
-    axes[0, 0].set_title('Original Grayscale')
-    axes[0, 0].axis('off')
+    # Create enhanced image
+    enhanced = gray.copy().astype(float)
     
-    axes[0, 1].imshow(enhanced, cmap='gray')
-    axes[0, 1].set_title('CLAHE Enhanced')
-    axes[0, 1].axis('off')
+    # Darken pixels that are already somewhat dark
+    # The darker the pixel, the more we darken it
+    for i in range(gray.shape[0]):
+        for j in range(gray.shape[1]):
+            pixel = gray[i, j]
+            if pixel < darkness_threshold:
+                # Make dark pixels much darker
+                # Formula: darker pixels get multiplied by smaller factor
+                factor = pixel / darkness_threshold
+                enhanced[i, j] = pixel * factor * 0.3  # Multiply by 0.3 to make it darker
+            else:
+                # Keep light pixels light (background)
+                enhanced[i, j] = 255
     
-    axes[0, 2].imshow(adaptive, cmap='gray')
-    axes[0, 2].set_title('Adaptive Threshold')
-    axes[0, 2].axis('off')
+    # Convert back to uint8
+    enhanced = np.clip(enhanced, 0, 255).astype(np.uint8)
     
-    axes[1, 0].imshow(final, cmap='gray')
-    axes[1, 0].set_title('Final Enhanced (Method 1)')
-    axes[1, 0].axis('off')
+    # Save result
+    cv2.imwrite(output_path, enhanced)
     
-    axes[1, 1].imshow(pil_gray, cmap='gray')
-    axes[1, 1].set_title('PIL Enhanced')
-    axes[1, 1].axis('off')
-    
-    axes[1, 2].imshow(pil_binary, cmap='gray')
-    axes[1, 2].set_title('PIL Binary')
-    axes[1, 2].axis('off')
-    
-    axes[2, 0].imshow(pil_otsu, cmap='gray')
-    axes[2, 0].set_title('Otsu Threshold')
-    axes[2, 0].axis('off')
-    
-    # Advanced method: Combine best features
-    advanced = advanced_enhancement(image_path)
-    axes[2, 1].imshow(advanced, cmap='gray')
-    axes[2, 1].set_title('Advanced Enhancement')
-    axes[2, 1].axis('off')
-    
-    # Super enhancement for very poor quality
-    super_enhanced = super_enhance(image_path)
-    axes[2, 2].imshow(super_enhanced, cmap='gray')
-    axes[2, 2].set_title('Super Enhanced')
-    axes[2, 2].axis('off')
-    
-    plt.tight_layout()
-    plt.show()
-    
-    return final, pil_otsu, advanced, super_enhanced
+    print(f"Enhanced image saved as: {output_path}")
+    return enhanced
 
-def advanced_enhancement(image_path, output_path=None):
+
+def simple_threshold(image_path, output_path="simple_threshold.jpg", threshold_value=127):
     """
-    Advanced enhancement specifically for ID cards with poor quality
+    Simplest approach - just apply a threshold
+    Everything darker than threshold becomes black, rest becomes white
     """
+    
     # Read image
     img = cv2.imread(image_path, cv2.IMREAD_GRAYSCALE)
     
-    # 1. Remove noise with Non-local Means Denoising
-    denoised = cv2.fastNlMeansDenoising(img, None, h=30, templateWindowSize=7, searchWindowSize=21)
+    # Apply simple threshold
+    _, binary = cv2.threshold(img, threshold_value, 255, cv2.THRESH_BINARY)
     
-    # 2. Improve contrast with histogram equalization
-    equalized = cv2.equalizeHist(denoised)
+    # Save result
+    cv2.imwrite(output_path, binary)
     
-    # 3. Apply Gaussian blur to smooth
-    blurred = cv2.GaussianBlur(equalized, (3, 3), 0)
-    
-    # 4. Sharpen the image
-    kernel = np.array([[0, -1, 0],
-                       [-1, 5, -1],
-                       [0, -1, 0]])
-    sharpened = cv2.filter2D(blurred, -1, kernel)
-    
-    # 5. Apply adaptive threshold
-    thresh = cv2.adaptiveThreshold(sharpened, 255, 
-                                  cv2.ADAPTIVE_THRESH_MEAN_C, 
-                                  cv2.THRESH_BINARY, 11, 5)
-    
-    # 6. Morphological operations to clean up
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))
-    cleaned = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel, iterations=1)
-    
-    # 7. Invert if needed (make text black on white background)
-    # Check if background is mostly black
-    if np.mean(cleaned) < 127:
-        cleaned = cv2.bitwise_not(cleaned)
-    
-    if output_path:
-        cv2.imwrite(output_path, cleaned)
-    
-    return cleaned
+    print(f"Thresholded image saved as: {output_path}")
+    return binary
 
-def super_enhance(image_path, output_path=None):
-    """
-    Super enhancement for extremely poor quality text
-    """
-    # Read image
-    img = cv2.imread(image_path, cv2.IMREAD_GRAYSCALE)
-    
-    # 1. Upscale image for better processing
-    upscaled = cv2.resize(img, None, fx=2, fy=2, interpolation=cv2.INTER_CUBIC)
-    
-    # 2. Apply bilateral filter
-    bilateral = cv2.bilateralFilter(upscaled, 15, 80, 80)
-    
-    # 3. Apply CLAHE
-    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8,8))
-    enhanced = clahe.apply(bilateral)
-    
-    # 4. Unsharp masking for edge enhancement
-    gaussian = cv2.GaussianBlur(enhanced, (0, 0), 2.0)
-    unsharp = cv2.addWeighted(enhanced, 2.0, gaussian, -1.0, 0)
-    
-    # 5. Apply Otsu's thresholding
-    _, otsu = cv2.threshold(unsharp, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    
-    # 6. Morphological gradient to enhance edges
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2, 2))
-    gradient = cv2.morphologyEx(otsu, cv2.MORPH_GRADIENT, kernel)
-    
-    # 7. Combine gradient with threshold
-    combined = cv2.addWeighted(otsu, 0.7, gradient, 0.3, 0)
-    
-    # 8. Final cleanup
-    kernel = np.ones((2, 2), np.uint8)
-    final = cv2.morphologyEx(combined, cv2.MORPH_CLOSE, kernel)
-    
-    # 9. Downscale back to original size
-    final = cv2.resize(final, (img.shape[1], img.shape[0]), interpolation=cv2.INTER_AREA)
-    
-    if output_path:
-        cv2.imwrite(output_path, final)
-    
-    return final
 
 # Main execution
 if __name__ == "__main__":
-    # Replace with your image path
+    # Your image path
     input_image = "id_card.jpg"
     
-    # Process with different methods
-    print("Processing image with multiple enhancement methods...")
+    # Method 1: Make all dark pixels pure black
+    enhance_black_pixels(input_image, "enhanced_pure_black.jpg", darkness_threshold=150)
     
-    # Method 1: Basic enhancement
-    _, _, _, enhanced1 = enhance_text_quality(input_image, "enhanced_method1.jpg")
-    print("✓ Method 1 complete - saved as 'enhanced_method1.jpg'")
+    # Method 2: Gradually darken based on current darkness
+    enhance_black_pixels_gradual(input_image, "enhanced_gradual.jpg", darkness_threshold=150)
     
-    # Method 2: PIL enhancement
-    _, _, enhanced2 = enhance_with_pillow(input_image, "enhanced_method2.jpg")
-    print("✓ Method 2 complete - saved as 'enhanced_method2.jpg'")
+    # Method 3: Simple threshold
+    simple_threshold(input_image, "enhanced_threshold.jpg", threshold_value=127)
     
-    # Method 3: Advanced enhancement
-    enhanced3 = advanced_enhancement(input_image, "enhanced_advanced.jpg")
-    print("✓ Advanced method complete - saved as 'enhanced_advanced.jpg'")
-    
-    # Method 4: Super enhancement
-    enhanced4 = super_enhance(input_image, "enhanced_super.jpg")
-    print("✓ Super enhancement complete - saved as 'enhanced_super.jpg'")
-    
-    # Display all results
-    print("\nDisplaying comparison of all methods...")
-    process_and_display(input_image)
-    
-    print("\nEnhancement complete! Check the output files for results.")
+    print("\nDone! Check the output images.")
+    print("Adjust 'darkness_threshold' value (0-255) to capture more or less text.")
