@@ -1,0 +1,291 @@
+import cv2
+import numpy as np
+
+def detect_and_enhance_text_smooth(image_path, output_path="enhanced_smooth.jpg"):
+    """
+    Detect text regions, enhance them, and smooth characters to fill gaps
+    """
+    
+    # Read image
+    img = cv2.imread(image_path)
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    
+    # Keep original for background
+    original_gray = gray.copy()
+    
+    # Step 1: Detect text regions using contours
+    _, binary = cv2.threshold(gray, 150, 255, cv2.THRESH_BINARY_INV)
+    
+    # Find contours (potential text regions)
+    contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    
+    # Create a mask for text regions
+    text_mask = np.zeros(gray.shape, dtype=np.uint8)
+    
+    # Filter contours to find text-like regions
+    for contour in contours:
+        x, y, w, h = cv2.boundingRect(contour)
+        area = cv2.contourArea(contour)
+        
+        if area < 20:  # Skip noise
+            continue
+            
+        aspect_ratio = w / h if h > 0 else 0
+        
+        if 0.1 < aspect_ratio < 15 and 5 < w < 500 and 5 < h < 100:
+            cv2.drawContours(text_mask, [contour], -1, 255, -1)
+    
+    # Step 2: Dilate mask to include character edges
+    kernel_dilate = np.ones((3,3), np.uint8)
+    text_mask_expanded = cv2.dilate(text_mask, kernel_dilate, iterations=2)
+    
+    # Step 3: Create enhanced image with expanded mask
+    enhanced = original_gray.copy()
+    
+    # First pass: Make text regions darker with expanded mask
+    for i in range(gray.shape[0]):
+        for j in range(gray.shape[1]):
+            if text_mask_expanded[i, j] > 0:  # Expanded text region
+                pixel = gray[i, j]
+                if pixel < 170:  # More generous threshold to catch light edges
+                    enhanced[i, j] = 0  # Make it black
+    
+    # Step 4: Apply smoothing to fill gaps in characters
+    # Create a mask of enhanced text
+    text_only = np.zeros_like(enhanced)
+    text_only[enhanced == 0] = 255
+    
+    # Apply morphological closing to fill small gaps
+    kernel_close = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+    text_filled = cv2.morphologyEx(text_only, cv2.MORPH_CLOSE, kernel_close)
+    
+    # Step 5: Merge smoothed text back with original background
+    final = original_gray.copy()
+    final[text_filled > 127] = 0  # Where text is detected, make it black
+    
+    # Save result
+    cv2.imwrite(output_path, final)
+    print(f"Enhanced image with smoothing saved as: {output_path}")
+    
+    # Save intermediate steps for debugging
+    cv2.imwrite("text_mask.jpg", text_mask)
+    cv2.imwrite("text_mask_expanded.jpg", text_mask_expanded)
+    cv2.imwrite("text_filled.jpg", text_filled)
+    
+    return final
+
+
+def detect_and_enhance_with_edge_fill(image_path, output_path="enhanced_edge_fill.jpg"):
+    """
+    Enhanced method that specifically targets edge pixels for better character completeness
+    """
+    
+    # Read image
+    img = cv2.imread(image_path)
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    original = gray.copy()
+    
+    # Step 1: Initial text detection
+    _, binary = cv2.threshold(gray, 150, 255, cv2.THRESH_BINARY_INV)
+    contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    
+    # Create text region mask
+    text_mask = np.zeros(gray.shape, dtype=np.uint8)
+    
+    for contour in contours:
+        x, y, w, h = cv2.boundingRect(contour)
+        area = cv2.contourArea(contour)
+        
+        if area < 20:
+            continue
+            
+        aspect_ratio = w / h if h > 0 else 0
+        if 0.1 < aspect_ratio < 15 and 5 < w < 500 and 5 < h < 100:
+            cv2.drawContours(text_mask, [contour], -1, 255, -1)
+    
+    # Step 2: Process each text region individually for better control
+    enhanced = original.copy()
+    
+    # Dilate text mask
+    kernel = np.ones((5,5), np.uint8)
+    text_mask_dilated = cv2.dilate(text_mask, kernel, iterations=1)
+    
+    # Find individual text regions
+    contours, _ = cv2.findContours(text_mask_dilated, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    
+    for contour in contours:
+        x, y, w, h = cv2.boundingRect(contour)
+        
+        # Extract region
+        region = gray[y:y+h, x:x+w]
+        region_enhanced = region.copy()
+        
+        # Apply local threshold to capture more edge pixels
+        local_mean = np.mean(region)
+        threshold_value = min(local_mean + 20, 180)  # Adaptive local threshold
+        
+        # Make dark and medium pixels black
+        region_enhanced[region < threshold_value] = 0
+        
+        # Fill small holes in characters
+        region_binary = (region_enhanced == 0).astype(np.uint8) * 255
+        kernel_small = np.ones((2,2), np.uint8)
+        region_filled = cv2.morphologyEx(region_binary, cv2.MORPH_CLOSE, kernel_small)
+        
+        # Convert back
+        region_final = np.where(region_filled > 127, 0, region)
+        
+        # Place back
+        enhanced[y:y+h, x:x+w] = region_final
+    
+    cv2.imwrite(output_path, enhanced)
+    print(f"Enhanced image with edge filling saved as: {output_path}")
+    
+    return enhanced
+
+
+def detect_and_enhance_with_interpolation(image_path, output_path="enhanced_interpolate.jpg"):
+    """
+    Use interpolation to smooth character edges
+    """
+    
+    # Read image
+    img = cv2.imread(image_path)
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    original = gray.copy()
+    
+    # Step 1: Detect text regions
+    _, binary = cv2.threshold(gray, 150, 255, cv2.THRESH_BINARY_INV)
+    contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    
+    text_mask = np.zeros(gray.shape, dtype=np.uint8)
+    
+    for contour in contours:
+        x, y, w, h = cv2.boundingRect(contour)
+        area = cv2.contourArea(contour)
+        
+        if area < 20:
+            continue
+            
+        aspect_ratio = w / h if h > 0 else 0
+        if 0.1 < aspect_ratio < 15 and 5 < w < 500 and 5 < h < 100:
+            cv2.drawContours(text_mask, [contour], -1, 255, -1)
+    
+    # Step 2: Expand mask to include edges
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    text_mask_expanded = cv2.dilate(text_mask, kernel, iterations=1)
+    
+    # Step 3: Create gradient-based enhancement
+    enhanced = original.copy()
+    
+    for i in range(gray.shape[0]):
+        for j in range(gray.shape[1]):
+            if text_mask_expanded[i, j] > 0:
+                pixel = original[i, j]
+                
+                # Check neighborhood for better edge handling
+                y_start = max(0, i-1)
+                y_end = min(gray.shape[0], i+2)
+                x_start = max(0, j-1)
+                x_end = min(gray.shape[1], j+2)
+                
+                neighborhood = original[y_start:y_end, x_start:x_end]
+                min_neighbor = np.min(neighborhood)
+                
+                # If any neighbor is dark (text), and current pixel is medium-dark
+                if min_neighbor < 100 and pixel < 180:
+                    # Interpolate darkness based on darkest neighbor
+                    enhanced[i, j] = min(pixel * 0.3, min_neighbor)
+                elif pixel < 150:
+                    enhanced[i, j] = 0
+    
+    # Step 4: Final smoothing pass
+    # Apply Gaussian blur to smooth edges
+    text_regions = (enhanced < 50).astype(np.uint8) * 255
+    text_smooth = cv2.GaussianBlur(text_regions, (3, 3), 0)
+    
+    # Threshold back to binary
+    _, text_final = cv2.threshold(text_smooth, 127, 255, cv2.THRESH_BINARY)
+    
+    # Merge with original
+    final = original.copy()
+    final[text_final > 127] = 0
+    
+    cv2.imwrite(output_path, final)
+    print(f"Enhanced image with interpolation saved as: {output_path}")
+    
+    return final
+
+
+def simple_smooth_enhancement(image_path, output_path="enhanced_simple_smooth.jpg"):
+    """
+    Simplest approach with smoothing - recommended to try first
+    """
+    
+    # Read image
+    img = cv2.imread(image_path)
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    original = gray.copy()
+    
+    # Step 1: Detect text with contours
+    _, binary = cv2.threshold(gray, 150, 255, cv2.THRESH_BINARY_INV)
+    contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    
+    text_mask = np.zeros(gray.shape, dtype=np.uint8)
+    
+    for contour in contours:
+        x, y, w, h = cv2.boundingRect(contour)
+        area = cv2.contourArea(contour)
+        if area < 20:
+            continue
+        aspect_ratio = w / h if h > 0 else 0
+        if 0.1 < aspect_ratio < 15 and 5 < w < 500 and 5 < h < 100:
+            cv2.drawContours(text_mask, [contour], -1, 255, -1)
+    
+    # Step 2: Dilate mask a bit to catch edges
+    kernel = np.ones((3,3), np.uint8)
+    text_mask = cv2.dilate(text_mask, kernel, iterations=1)
+    
+    # Step 3: Enhance with more generous threshold
+    enhanced = original.copy()
+    enhanced[text_mask > 0] = np.where(
+        gray[text_mask > 0] < 170,  # If pixel is somewhat dark
+        0,                           # Make it black
+        original[text_mask > 0]      # Otherwise keep original
+    )
+    
+    # Step 4: Simple smoothing - fill small gaps
+    text_pixels = (enhanced == 0).astype(np.uint8)
+    kernel = np.ones((2,2), np.uint8)
+    text_smooth = cv2.morphologyEx(text_pixels, cv2.MORPH_CLOSE, kernel)
+    
+    # Final image
+    final = original.copy()
+    final[text_smooth > 0] = 0
+    
+    cv2.imwrite(output_path, final)
+    print(f"Simple smooth enhancement saved as: {output_path}")
+    
+    return final
+
+
+# Main execution
+if __name__ == "__main__":
+    # Your image path
+    input_image = "id_card.jpg"
+    
+    print("Method 1: Contour detection with character smoothing")
+    enhanced1 = detect_and_enhance_text_smooth(input_image, "enhanced_smooth.jpg")
+    
+    print("\nMethod 2: Edge filling for complete characters")
+    enhanced2 = detect_and_enhance_with_edge_fill(input_image, "enhanced_edge_fill.jpg")
+    
+    print("\nMethod 3: Interpolation-based smoothing")
+    enhanced3 = detect_and_enhance_with_interpolation(input_image, "enhanced_interpolate.jpg")
+    
+    print("\nMethod 4: Simple smoothing (recommended)")
+    enhanced4 = simple_smooth_enhancement(input_image, "enhanced_simple_smooth.jpg")
+    
+    print("\n✅ Done! Check the output images.")
+    print("Intermediate masks saved for debugging.")
+    print("Try 'enhanced_simple_smooth.jpg' first - it's usually the best balance.")
