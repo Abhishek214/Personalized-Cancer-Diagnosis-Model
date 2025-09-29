@@ -1,0 +1,240 @@
+import cv2
+import numpy as np
+
+def detect_and_enhance_text(image_path, output_path="enhanced_text_only.jpg"):
+    """
+    Detect text regions and enhance ONLY those areas, keeping rest of image unchanged
+    """
+    
+    # Read image
+    img = cv2.imread(image_path)
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    
+    # Keep original for background
+    original_gray = gray.copy()
+    
+    # Step 1: Detect text regions using contours
+    # Apply threshold to get binary image
+    _, binary = cv2.threshold(gray, 150, 255, cv2.THRESH_BINARY_INV)
+    
+    # Find contours (potential text regions)
+    contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    
+    # Create a mask for text regions
+    text_mask = np.zeros(gray.shape, dtype=np.uint8)
+    
+    # Filter contours to find text-like regions
+    for contour in contours:
+        # Get bounding box
+        x, y, w, h = cv2.boundingRect(contour)
+        
+        # Filter based on size
+        area = cv2.contourArea(contour)
+        if area < 20:  # Skip very small contours (noise)
+            continue
+            
+        aspect_ratio = w / h if h > 0 else 0
+        
+        # Typical text has aspect ratio between 0.2 and 10
+        if 0.1 < aspect_ratio < 15 and 5 < w < 500 and 5 < h < 100:
+            # This looks like text - add to mask
+            cv2.drawContours(text_mask, [contour], -1, 255, -1)
+    
+    # Step 2: Dilate mask slightly to include full characters
+    kernel = np.ones((3,3), np.uint8)
+    text_mask = cv2.dilate(text_mask, kernel, iterations=1)
+    
+    # Step 3: Create enhanced image - START WITH ORIGINAL
+    enhanced = original_gray.copy()
+    
+    # Only modify text regions
+    text_pixels = text_mask > 0
+    
+    # Make ONLY text regions darker (enhance black pixels in text areas)
+    for i in range(gray.shape[0]):
+        for j in range(gray.shape[1]):
+            if text_mask[i, j] > 0:  # Only if it's a text region
+                pixel = gray[i, j]
+                if pixel < 150:  # If it's darkish (likely text)
+                    enhanced[i, j] = 0  # Make it pure black
+                # else keep original pixel value
+    
+    # Save result
+    cv2.imwrite(output_path, enhanced)
+    print(f"Enhanced image saved as: {output_path}")
+    
+    # Also save the mask for debugging
+    cv2.imwrite("text_mask.jpg", text_mask)
+    print("Text mask saved as: text_mask.jpg (shows detected text regions)")
+    
+    return enhanced, text_mask
+
+
+def detect_text_using_morphology(image_path, output_path="enhanced_morph.jpg"):
+    """
+    Alternative method using morphological operations to find text
+    Keeps original image, only enhances text regions
+    """
+    
+    # Read image
+    img = cv2.imread(image_path)
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    original = gray.copy()
+    
+    # Apply gradient to find edges (text boundaries)
+    gradient = cv2.morphologyEx(gray, cv2.MORPH_GRADIENT, np.ones((2,2), np.uint8))
+    
+    # Threshold to get binary image
+    _, binary = cv2.threshold(gradient, 30, 255, cv2.THRESH_BINARY)
+    
+    # Connect nearby components (characters in same word)
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (10, 2))
+    connected = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
+    
+    # Find contours
+    contours, _ = cv2.findContours(connected, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    
+    # Start with original image
+    enhanced = original.copy()
+    
+    # Process each detected text region
+    for contour in contours:
+        x, y, w, h = cv2.boundingRect(contour)
+        
+        # Filter for text-like regions
+        if w > 10 and h > 5 and w < 500 and h < 100:
+            # Extract region from original
+            region = original[y:y+h, x:x+w]
+            
+            # Enhance this region - make dark pixels darker
+            region_enhanced = region.copy()
+            region_enhanced[region < 150] = 0  # Make dark pixels black
+            
+            # Place enhanced region back
+            enhanced[y:y+h, x:x+w] = region_enhanced
+    
+    # Save result
+    cv2.imwrite(output_path, enhanced)
+    print(f"Enhanced image saved as: {output_path}")
+    
+    return enhanced
+
+
+def detect_text_using_mser(image_path, output_path="enhanced_mser.jpg"):
+    """
+    Use MSER (Maximally Stable Extremal Regions) to detect text
+    Keeps original image, only enhances detected character regions
+    """
+    
+    # Read image
+    img = cv2.imread(image_path)
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    original = gray.copy()
+    
+    # Create MSER detector with correct parameters
+    mser = cv2.MSER_create(
+        min_area=30,        # Minimum area of detected region (no underscore)
+        max_area=2000,      # Maximum area of detected region (no underscore)
+        delta=5,            # Stability threshold (no underscore)
+    )
+    
+    # Detect regions
+    regions, _ = mser.detectRegions(gray)
+    
+    # Create mask for text regions
+    mask = np.zeros(gray.shape, dtype=np.uint8)
+    
+    # Draw detected regions
+    for region in regions:
+        # Get convex hull around region
+        hull = cv2.convexHull(region)
+        cv2.fillPoly(mask, [hull], 255)
+    
+    # Dilate mask to connect nearby characters
+    kernel = np.ones((3,3), np.uint8)
+    mask = cv2.dilate(mask, kernel, iterations=1)
+    
+    # Create enhanced image starting with original
+    enhanced = original.copy()
+    
+    # Apply enhancement only to detected regions
+    for i in range(gray.shape[0]):
+        for j in range(gray.shape[1]):
+            if mask[i, j] > 0:  # Only if it's a detected text region
+                pixel = original[i, j]
+                if pixel < 150:  # If it's dark (likely text)
+                    enhanced[i, j] = 0  # Make it pure black
+                # else keep original pixel
+    
+    # Save result
+    cv2.imwrite(output_path, enhanced)
+    print(f"Enhanced image saved as: {output_path}")
+    
+    # Save mask for debugging
+    cv2.imwrite("mser_mask.jpg", mask)
+    print("MSER mask saved as: mser_mask.jpg")
+    
+    return enhanced
+
+
+def simple_selective_enhancement(image_path, output_path="enhanced_simple.jpg", block_size=15):
+    """
+    Simpler approach: Use adaptive threshold to find text regions
+    Then enhance only those regions
+    """
+    
+    # Read image
+    img = cv2.imread(image_path)
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    original = gray.copy()
+    
+    # Use adaptive threshold to find text regions
+    adaptive = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_MEAN_C, 
+                                   cv2.THRESH_BINARY_INV, block_size, 10)
+    
+    # Find contours in the adaptive threshold
+    contours, _ = cv2.findContours(adaptive, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    
+    # Create mask for valid text regions
+    mask = np.zeros(gray.shape, dtype=np.uint8)
+    
+    for contour in contours:
+        area = cv2.contourArea(contour)
+        if 20 < area < 5000:  # Reasonable size for text
+            cv2.drawContours(mask, [contour], -1, 255, -1)
+    
+    # Enhance: Start with original
+    enhanced = original.copy()
+    
+    # Only darken pixels that are in mask AND already somewhat dark
+    for i in range(gray.shape[0]):
+        for j in range(gray.shape[1]):
+            if mask[i, j] > 0 and original[i, j] < 160:
+                enhanced[i, j] = 0  # Make text black
+    
+    cv2.imwrite(output_path, enhanced)
+    print(f"Enhanced image saved as: {output_path}")
+    
+    return enhanced
+
+
+# Main execution
+if __name__ == "__main__":
+    # Your image path
+    input_image = "id_card.jpg"
+    
+    print("Method 1: Contour-based text detection")
+    enhanced1, mask = detect_and_enhance_text(input_image, "enhanced_contour.jpg")
+    
+    print("\nMethod 2: Morphology-based text detection")
+    enhanced2 = detect_text_using_morphology(input_image, "enhanced_morphology.jpg")
+    
+    print("\nMethod 3: MSER-based text detection (fixed)")
+    enhanced3 = detect_text_using_mser(input_image, "enhanced_mser.jpg")
+    
+    print("\nMethod 4: Simple adaptive threshold")
+    enhanced4 = simple_selective_enhancement(input_image, "enhanced_simple.jpg")
+    
+    print("\n✅ Done! Check the output images.")
+    print("The mask images show which regions were detected as text.")
+    print("The enhanced images keep the original background intact.")
