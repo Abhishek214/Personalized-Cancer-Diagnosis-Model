@@ -1,111 +1,199 @@
 import cv2
 import numpy as np
 
-def enhance_black_pixels(image_path, output_path="enhanced.jpg", darkness_threshold=150):
+def enhance_text_regions(image_path, output_path="enhanced.jpg"):
     """
-    Simple function to make dark pixels (text) darker and more uniform
-    
-    Parameters:
-    - image_path: path to input image
-    - output_path: path to save enhanced image
-    - darkness_threshold: pixels darker than this will be enhanced (0-255)
+    Enhance text by finding and darkening entire text regions,
+    not just dark pixels. This preserves light pixels that are part of characters.
     """
     
     # Read image
     img = cv2.imread(image_path)
-    
-    # Convert to grayscale
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     
-    # Find dark pixels (likely text)
-    # Pixels below threshold are considered text
-    mask = gray < darkness_threshold
+    # Step 1: Use adaptive threshold to find ALL parts of text (dark AND light)
+    # This adapts to local brightness variations
+    adaptive = cv2.adaptiveThreshold(gray, 255, 
+                                    cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                                    cv2.THRESH_BINARY, 
+                                    blockSize=11,  # Size of neighborhood area
+                                    C=2)  # Constant subtracted from mean
     
-    # Make dark pixels uniformly darker
+    # Step 2: Invert if needed (we want text to be white, background black)
+    if np.mean(adaptive) > 127:
+        adaptive = cv2.bitwise_not(adaptive)
+    
+    # Step 3: Dilate to connect broken parts of characters
+    kernel = np.ones((2,2), np.uint8)
+    dilated = cv2.dilate(adaptive, kernel, iterations=1)
+    
+    # Step 4: Find where text regions are (white pixels in dilated image)
+    text_mask = dilated == 255
+    
+    # Step 5: Apply enhancement - darken all pixels in text regions
     enhanced = gray.copy()
-    enhanced[mask] = 0  # Make text pixels pure black
     
-    # Optional: Make light pixels uniformly lighter (background)
-    enhanced[~mask] = 255  # Make background pure white
+    # For pixels in text regions, make them darker
+    # but maintain relative differences
+    enhanced[text_mask] = np.clip(gray[text_mask] * 0.3, 0, 255).astype(np.uint8)
     
-    # Save result
+    # Make background uniformly white
+    enhanced[~text_mask] = 255
+    
     cv2.imwrite(output_path, enhanced)
-    
     print(f"Enhanced image saved as: {output_path}")
     return enhanced
 
 
-def enhance_black_pixels_gradual(image_path, output_path="enhanced_gradual.jpg", darkness_threshold=150):
+def local_enhancement(image_path, output_path="enhanced_local.jpg", window_size=15):
     """
-    Gradually darken pixels based on how dark they already are
-    Better for maintaining some detail in characters
+    Enhance text using local windows - processes small regions independently
+    This handles varying light conditions across the image
     """
     
-    # Read image
     img = cv2.imread(image_path)
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    enhanced = np.ones_like(gray) * 255  # Start with white image
     
-    # Convert to grayscale  
+    # Process image in small windows
+    for i in range(0, gray.shape[0], window_size//2):
+        for j in range(0, gray.shape[1], window_size//2):
+            # Extract window
+            window = gray[i:i+window_size, j:j+window_size]
+            
+            if window.size == 0:
+                continue
+                
+            # Find local threshold for this window
+            mean_val = np.mean(window)
+            std_val = np.std(window)
+            
+            # Only process if there's variation (likely contains text)
+            if std_val > 10:
+                # Local threshold: mean - k*std
+                local_threshold = mean_val - 0.5 * std_val
+                
+                # Create mask for this window
+                mask = window < local_threshold
+                
+                # Apply enhancement
+                enhanced_window = window.copy()
+                enhanced_window[mask] = 0  # Make text black
+                enhanced_window[~mask] = 255  # Make background white
+                
+                # Put back into image
+                enhanced[i:i+window_size, j:j+window_size] = enhanced_window
+    
+    cv2.imwrite(output_path, enhanced)
+    print(f"Enhanced image saved as: {output_path}")
+    return enhanced
+
+
+def smart_enhance(image_path, output_path="enhanced_smart.jpg"):
+    """
+    Smart enhancement that preserves all parts of characters
+    by using morphological operations to identify complete character regions
+    """
+    
+    img = cv2.imread(image_path)
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     
-    # Create enhanced image
-    enhanced = gray.copy().astype(float)
+    # Step 1: Mild blur to connect nearby pixels
+    blurred = cv2.GaussianBlur(gray, (3,3), 0)
     
-    # Darken pixels that are already somewhat dark
-    # The darker the pixel, the more we darken it
-    for i in range(gray.shape[0]):
-        for j in range(gray.shape[1]):
-            pixel = gray[i, j]
-            if pixel < darkness_threshold:
-                # Make dark pixels much darker
-                # Formula: darker pixels get multiplied by smaller factor
-                factor = pixel / darkness_threshold
-                enhanced[i, j] = pixel * factor * 0.3  # Multiply by 0.3 to make it darker
-            else:
-                # Keep light pixels light (background)
-                enhanced[i, j] = 255
+    # Step 2: Adaptive threshold with larger block size to capture whole characters
+    thresh = cv2.adaptiveThreshold(blurred, 255,
+                                  cv2.ADAPTIVE_THRESH_MEAN_C,
+                                  cv2.THRESH_BINARY,
+                                  blockSize=15,
+                                  C=8)
     
-    # Convert back to uint8
-    enhanced = np.clip(enhanced, 0, 255).astype(np.uint8)
+    # Step 3: Morphological closing to connect character parts
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3,3))
+    closed = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel)
     
-    # Save result
+    # Step 4: Find contours (character regions)
+    contours, _ = cv2.findContours(cv2.bitwise_not(closed), 
+                                   cv2.RETR_EXTERNAL, 
+                                   cv2.CHAIN_APPROX_SIMPLE)
+    
+    # Step 5: Create mask of all text regions
+    mask = np.zeros_like(gray)
+    for contour in contours:
+        area = cv2.contourArea(contour)
+        # Filter small noise (adjust these values based on your image)
+        if area > 10:  # Minimum area for a character
+            cv2.drawContours(mask, [contour], -1, 255, -1)
+    
+    # Step 6: Dilate mask slightly to include light pixels around characters
+    mask = cv2.dilate(mask, np.ones((3,3), np.uint8), iterations=1)
+    
+    # Step 7: Apply enhancement
+    enhanced = np.ones_like(gray) * 255  # White background
+    text_regions = mask == 255
+    
+    # Darken all pixels in text regions proportionally
+    enhanced[text_regions] = np.clip(gray[text_regions] * 0.2, 0, 100).astype(np.uint8)
+    
     cv2.imwrite(output_path, enhanced)
-    
     print(f"Enhanced image saved as: {output_path}")
     return enhanced
 
 
-def simple_threshold(image_path, output_path="simple_threshold.jpg", threshold_value=127):
+def best_for_ocr(image_path, output_path="enhanced_ocr.jpg"):
     """
-    Simplest approach - just apply a threshold
-    Everything darker than threshold becomes black, rest becomes white
+    Combination approach specifically optimized for OCR
+    Preserves all character information while maximizing contrast
     """
     
-    # Read image
-    img = cv2.imread(image_path, cv2.IMREAD_GRAYSCALE)
+    img = cv2.imread(image_path)
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     
-    # Apply simple threshold
-    _, binary = cv2.threshold(img, threshold_value, 255, cv2.THRESH_BINARY)
+    # Apply CLAHE to improve local contrast
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
+    enhanced_contrast = clahe.apply(gray)
     
-    # Save result
-    cv2.imwrite(output_path, binary)
+    # Use Otsu's method to find optimal threshold
+    # But apply it locally to handle varying conditions
+    _, otsu_global = cv2.threshold(enhanced_contrast, 0, 255, 
+                                   cv2.THRESH_BINARY + cv2.THRESH_OTSU)
     
-    print(f"Thresholded image saved as: {output_path}")
-    return binary
+    # Also create adaptive threshold
+    adaptive = cv2.adaptiveThreshold(enhanced_contrast, 255,
+                                    cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                                    cv2.THRESH_BINARY,
+                                    blockSize=11,
+                                    C=2)
+    
+    # Combine both methods - take darker pixel from each
+    combined = np.minimum(otsu_global, adaptive)
+    
+    # Clean up with morphology
+    kernel = np.ones((2,2), np.uint8)
+    cleaned = cv2.morphologyEx(combined, cv2.MORPH_CLOSE, kernel)
+    cleaned = cv2.morphologyEx(cleaned, cv2.MORPH_OPEN, kernel)
+    
+    cv2.imwrite(output_path, cleaned)
+    print(f"Enhanced image saved as: {output_path}")
+    return cleaned
 
 
 # Main execution
 if __name__ == "__main__":
-    # Your image path
     input_image = "id_card.jpg"
     
-    # Method 1: Make all dark pixels pure black
-    enhance_black_pixels(input_image, "enhanced_pure_black.jpg", darkness_threshold=150)
+    print("Processing with different methods...\n")
     
-    # Method 2: Gradually darken based on current darkness
-    enhance_black_pixels_gradual(input_image, "enhanced_gradual.jpg", darkness_threshold=150)
+    # Method 1: Enhance entire text regions
+    enhance_text_regions(input_image, "enhanced_regions.jpg")
     
-    # Method 3: Simple threshold
-    simple_threshold(input_image, "enhanced_threshold.jpg", threshold_value=127)
+    # Method 2: Local window enhancement
+    local_enhancement(input_image, "enhanced_local.jpg")
     
-    print("\nDone! Check the output images.")
-    print("Adjust 'darkness_threshold' value (0-255) to capture more or less text.")
+    # Method 3: Smart enhancement with contour detection
+    smart_enhance(input_image, "enhanced_smart.jpg")
+    
+    # Method 4: Best for OCR
+    best_for_ocr(input_image, "enhanced_ocr.jpg")
+    
+    print("\nDone! Try different methods to see which preserves your text best.")
