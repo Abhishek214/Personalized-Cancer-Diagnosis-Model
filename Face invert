@@ -1,0 +1,12 @@
+import pytesseract
+
+osd = pytesseract.image_to_osd(image)
+angle = int(osd.split('\n')[2].split(':')[1].strip())
+# Returns 0, 90, 180, or 270
+
+
+
+
+
+
+
